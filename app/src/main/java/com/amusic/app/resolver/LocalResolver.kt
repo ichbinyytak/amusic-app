@@ -137,15 +137,15 @@ class LocalResolver(private val context: Context) {
 
     /**
      * 街声 StreetVoice 原生直通解析 (双路并发拉取音频流与歌词)
-     * 手机直连 streetvoice.com 或 streetvoice.cn，耗时仅 50~100ms
+     * 国内专属高速电信节点优先 (www.streetvoice.cn)，海外节点备用 (streetvoice.com)
      */
     private suspend fun resolveStreetVoice(songId: String): ResolveResult? = coroutineScope {
         val t0 = System.currentTimeMillis()
-        val hosts = listOf("com", "cn")
-        for (host in hosts) {
+        val domains = listOf("www.streetvoice.cn", "streetvoice.com")
+        for (domain in domains) {
             try {
-                val hlsUrl = "https://streetvoice.$host/api/v5/song/$songId/hls/file/"
-                val detailUrl = "https://streetvoice.$host/api/v5/song/$songId/"
+                val hlsUrl = "https://$domain/api/v5/song/$songId/hls/file/"
+                val detailUrl = "https://$domain/api/v5/song/$songId/"
 
                 val hlsDeferred = async(Dispatchers.IO) {
                     val req = Request.Builder()
@@ -183,11 +183,11 @@ class LocalResolver(private val context: Context) {
                 if (!file.isNullOrBlank() && file.contains(".m3u8")) {
                     val cost = System.currentTimeMillis() - t0
                     val lyricCount = lyricsArray?.length() ?: 0
-                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($host, ${cost}ms, 歌词: ${lyricCount}行): $file")
+                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($domain, ${cost}ms, 歌词: ${lyricCount}行): $file")
                     return@coroutineScope ResolveResult(
                         success = true,
                         url = file,
-                        sourceName = "街声官方通道 ($host 端侧直通)",
+                        sourceName = "街声官方通道 ($domain 端侧直通)",
                         costMs = cost,
                         lyrics = lyricsArray
                     )
@@ -201,10 +201,10 @@ class LocalResolver(private val context: Context) {
      * 单独获取街声歌词（供 /api/lyric 独立拦截使用）
      */
     suspend fun fetchStreetVoiceLyrics(songId: String): String? = withContext(Dispatchers.IO) {
-        val hosts = listOf("com", "cn")
-        for (host in hosts) {
+        val domains = listOf("www.streetvoice.cn", "streetvoice.com")
+        for (domain in domains) {
             try {
-                val url = "https://streetvoice.$host/api/v5/song/$songId/"
+                val url = "https://$domain/api/v5/song/$songId/"
                 val req = Request.Builder()
                     .url(url)
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -330,9 +330,9 @@ class LocalResolver(private val context: Context) {
         val t0 = System.currentTimeMillis()
         try {
             val req = Request.Builder()
-                .url("https://streetvoice.com/api/v5/song/123688/hls/file/")
+                .url("https://www.streetvoice.cn/api/v5/song/123688/hls/file/")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
-                .header("User-Agent", "Mozilla/5.0")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 .build()
             httpClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
@@ -344,7 +344,7 @@ class LocalResolver(private val context: Context) {
         try {
             val t1 = System.currentTimeMillis()
             val req = Request.Builder()
-                .url("https://streetvoice.cn/api/v5/song/123688/hls/file/")
+                .url("https://streetvoice.com/api/v5/song/123688/hls/file/")
                 .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                 .header("User-Agent", "Mozilla/5.0")
                 .build()

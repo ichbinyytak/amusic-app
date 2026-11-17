@@ -4,12 +4,14 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.net.Uri
 import android.net.http.SslError
+import android.util.Log
 import android.view.View
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -77,6 +79,28 @@ class AmusicWebBridge(
         }
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): WebResourceResponse? {
+                val url = request?.url?.toString() ?: ""
+                if (url.contains("hls.min.js") || url.contains("hls.js")) {
+                    try {
+                        val input = webView.context.assets.open("hls.min.js")
+                        val response = WebResourceResponse("application/javascript", "UTF-8", input)
+                        response.responseHeaders = mapOf(
+                            "Access-Control-Allow-Origin" to "*",
+                            "Cache-Control" to "public, max-age=31536000"
+                        )
+                        Log.i("AmusicNative", "✓ 端侧 0ms 本地拦截命中 hls.min.js")
+                        return response
+                    } catch (e: Exception) {
+                        Log.w("AmusicNative", "从本地 assets 加载 hls.min.js 失败", e)
+                    }
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 callbacks.onPageStarted()
             }
