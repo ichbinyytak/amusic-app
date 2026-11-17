@@ -103,6 +103,7 @@ class AmusicWebBridge(
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 callbacks.onPageStarted()
+                injectNativeBridge(view)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -255,16 +256,34 @@ class AmusicWebBridge(
                     var _origFetch = window.fetch;
                     window.fetch = async function(input, init) {
                         var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+                        var signal = init && init.signal;
+                        if (signal && signal.aborted) {
+                            var abortErr = new Error("The user aborted a request.");
+                            abortErr.name = "AbortError";
+                            throw abortErr;
+                        }
 
                         // A. 拦截 /api/resolve: 优先走端侧极速直连与街声直通 (含带回同源歌词)
                         if (url.indexOf('/api/resolve') !== -1 && init && init.method === 'POST') {
                             try {
                                 if (window.AmusicNative && typeof window.AmusicNative.resolveSong === 'function') {
                                     var payloadStr = typeof init.body === 'string' ? init.body : JSON.stringify(init.body || {});
-                                    var localRes = await new Promise(function(resolve) {
+                                    var localRes = await new Promise(function(resolve, reject) {
                                         var reqId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
                                         window.__amusic_resolve_callbacks = window.__amusic_resolve_callbacks || {};
                                         window.__amusic_resolve_callbacks[reqId] = resolve;
+
+                                        if (signal) {
+                                            signal.addEventListener('abort', function() {
+                                                if (window.__amusic_resolve_callbacks[reqId]) {
+                                                    delete window.__amusic_resolve_callbacks[reqId];
+                                                }
+                                                var err = new Error("The user aborted a request.");
+                                                err.name = "AbortError";
+                                                reject(err);
+                                            }, { once: true });
+                                        }
+
                                         setTimeout(function() {
                                             if (window.__amusic_resolve_callbacks[reqId]) {
                                                 delete window.__amusic_resolve_callbacks[reqId];

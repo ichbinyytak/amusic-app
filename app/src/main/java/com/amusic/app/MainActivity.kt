@@ -224,11 +224,6 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
         binding.btnChangeUrl.setOnClickListener {
             showServerConfigDialog()
         }
-
-        binding.rootContainer.setOnLongClickListener {
-            showServerConfigDialog()
-            true
-        }
     }
 
     private fun setupBackNavigation() {

@@ -133,11 +133,21 @@ class MusicService : Service() {
         return START_STICKY
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // 彻底根除应用划卡后产生死锁通知栏及后台僵尸服务
+        audioFocusHelper.abandonFocus()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     fun updatePlaybackState(playing: Boolean) {
         this.isPlaying = playing
 
         if (playing) {
             audioFocusHelper.requestFocus()
+        } else {
+            audioFocusHelper.abandonFocus()
         }
 
         mediaSessionManager.updatePlaybackState(playing)
@@ -156,6 +166,7 @@ class MusicService : Service() {
         }
 
         this.currentArtworkUrl = artworkUrl
+        this.cachedArtwork = null // 关键重置：防止切歌时残留上一首歌曲的封面造成状态污染
         mediaSessionManager.updateMetadata(currentTitle, currentArtist, currentAlbum, null)
         startForegroundSafely(buildNotification())
 
@@ -169,8 +180,6 @@ class MusicService : Service() {
                     startForegroundSafely(buildNotification())
                 }
             }
-        } else {
-            cachedArtwork = null
         }
     }
 

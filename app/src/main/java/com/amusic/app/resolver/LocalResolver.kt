@@ -283,13 +283,14 @@ class LocalResolver(private val context: Context) {
 
         // 1. 街声官方探针 (本机实测)
         val svLatency = measureStreetVoiceLatency()
+        val roundedSvLat = kotlin.math.round(svLatency).toLong()
         list.add(JSONObject().apply {
             put("id", "sv_official")
             put("name", "街声官方直通通道")
             put("platform", "streetvoice")
             put("status", if (svLatency < 5000) "ok" else "failed")
-            put("latency_ms", svLatency)
-            put("success_count", 99)
+            put("latency_ms", roundedSvLat)
+            put("success_count", if (svLatency < 5000) 100 else 0)
         })
 
         // 2. 本机实测活跃音源端点
@@ -298,13 +299,14 @@ class LocalResolver(private val context: Context) {
             val deferreds = endpointsToTest.map { ep ->
                 async {
                     val lat = measureEndpointLatency(ep)
+                    val roundedLat = kotlin.math.round(lat).toLong()
                     JSONObject().apply {
                         put("id", ep.id)
                         put("name", ep.name)
                         put("platform", ep.platform)
                         put("status", if (lat < 5000) "ok" else "failed")
-                        put("latency_ms", lat)
-                        put("success_count", ep.sampleLatencyMs)
+                        put("latency_ms", roundedLat)
+                        put("success_count", if (lat < 5000) 100 else 0)
                     }
                 }
             }
@@ -478,6 +480,22 @@ class LocalResolver(private val context: Context) {
         val t1 = targetTitle.lowercase().replace(" ", "")
         if (!n1.contains(t1) && !t1.contains(n1)) return false
 
+        // 关键校验歌手：若提供了 targetArtist，防止匹配到同名不同歌手的歌曲或翻唱
+        if (targetArtist.isNotBlank() && singer.isNotBlank()) {
+            val s1 = singer.lowercase().replace(" ", "")
+            val a1 = targetArtist.lowercase().replace(" ", "")
+            val artistMatched = s1.contains(a1) || a1.contains(s1) ||
+                    a1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
+                        val p = part.trim()
+                        p.isNotEmpty() && s1.contains(p)
+                    } ||
+                    s1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
+                        val p = part.trim()
+                        p.isNotEmpty() && a1.contains(p)
+                    }
+            if (!artistMatched) return false
+        }
+
         if (targetDuration > 0 && dur > 0 && abs(dur - targetDuration) > 12) {
             return false
         }
@@ -552,8 +570,25 @@ class LocalResolver(private val context: Context) {
             httpClient.newCall(req).execute().use { resp ->
                 val code = resp.code
                 if (code == 200 || code == 206) {
-                    val len = resp.header("Content-Length")?.toLongOrNull() ?: 0L
+                    val contentType = resp.header("Content-Type")?.lowercase() ?: ""
+                    // 过滤掉带 200 状态码的 HTML/JSON 报错页
+                    if (contentType.contains("text/html") || contentType.contains("application/json")) {
+                        return false
+                    }
+
+                    // 1. 若为 206 Partial Content，从 Content-Range: bytes 0-1024/TOTAL 获取真实音频总大小
+                    val contentRange = resp.header("Content-Range")
+                    val totalLen = if (!contentRange.isNullOrBlank()) {
+                        val match = Regex("""bytes\s+\d+-\d+/(\d+)""").find(contentRange)
+                        match?.groupValues?.get(1)?.toLongOrNull()
+                    } else null
+
+                    // 2. 若为 200 OK，则直接读 Content-Length
+                    val len = totalLen ?: resp.header("Content-Length")?.toLongOrNull() ?: 0L
+
+                    // 拦截 80KB / 180KB 虚假试听/静音空音频片段
                     if (len == 81920L || len == 184320L) return false
+
                     return true
                 }
             }
@@ -562,9 +597,10 @@ class LocalResolver(private val context: Context) {
     }
 
     private fun cleanSearchKeyword(title: String): String {
-        return title
+        val cleaned = title
             .replace(Regex("""\(.*?\)|\[.*?]|【.*?】|（.*?）"""), " ")
             .replace(Regex("""\s+"""), " ")
             .trim()
+        return cleaned.ifBlank { title.trim() }
     }
 }

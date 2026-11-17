@@ -5,7 +5,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-layout.buildDirectory.set(File("/home/yytak/.cache/amusic-app-build/app"))
+val userHome = System.getProperty("user.home") ?: "/tmp"
+layout.buildDirectory.set(File(userHome, ".cache/amusic-app-build/app"))
 
 android {
     namespace = "com.amusic.app"
