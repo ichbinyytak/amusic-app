@@ -10,23 +10,34 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.util.Log
 import android.view.View
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.amusic.app.bridge.AmusicWebBridge
 import com.amusic.app.databinding.ActivityMainBinding
 import com.amusic.app.media.MediaSessionManager
 import com.amusic.app.media.MusicService
+import com.amusic.app.resolver.LocalResolver
 import com.amusic.app.ui.ServerConfigDialog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
+
+    companion object {
+        private const val TAG = "MainActivity"
+    }
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: SharedPreferences
     private lateinit var webBridge: AmusicWebBridge
+    private lateinit var localResolver: LocalResolver
 
     private var musicService: MusicService? = null
     private var isBound = false
@@ -52,6 +63,7 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
         setContentView(binding.root)
 
         prefs = getSharedPreferences("amusic_prefs", Context.MODE_PRIVATE)
+        localResolver = LocalResolver(this)
 
         bindMusicService()
         checkNotificationPermission()
@@ -60,6 +72,17 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
         setupBackNavigation()
 
         loadCurrentServerUrl()
+        triggerDailySourceSync()
+    }
+
+    private fun triggerDailySourceSync() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                localResolver.syncSources(force = false)
+            } catch (e: Exception) {
+                Log.w(TAG, "每日音源静默同步重试: ${e.message}")
+            }
+        }
     }
 
     private fun bindMusicService() {
@@ -127,6 +150,35 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                 override fun onOpenSettings() {
                     runOnUiThread {
                         showServerConfigDialog()
+                    }
+                }
+
+                override fun onResolveSong(reqId: String, payloadJson: String) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val payload = JSONObject(payloadJson)
+                            val title = payload.optString("title").ifBlank { payload.optString("name") }
+                            val artist = payload.optString("artist")
+                            val album = payload.optString("album")
+                            val duration = payload.optInt("duration", 0)
+
+                            val result = localResolver.resolve(title, artist, album, duration)
+                            if (result != null && result.success && !result.url.isNullOrBlank()) {
+                                val resJson = JSONObject().apply {
+                                    put("success", true)
+                                    put("url", result.url)
+                                    put("source_name", result.sourceName)
+                                    put("costMs", result.costMs)
+                                }.toString()
+                                webBridge.sendResolveResult(reqId, resJson)
+                            } else {
+                                // 本地无法解析或失败，透传 null 回退至原版云端 fetch
+                                webBridge.sendResolveResult(reqId, null)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "端侧直链解析失败，回退云端: ${e.message}")
+                            webBridge.sendResolveResult(reqId, null)
+                        }
                     }
                 }
             }
@@ -231,7 +283,6 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
 
     override fun onDestroy() {
         super.onDestroy()
-        // 关键防护：显式解绑回调，杜绝 Activity 内存泄漏
         musicService?.setControlListener(null)
         if (isBound) {
             unbindService(serviceConnection)

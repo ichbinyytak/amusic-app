@@ -16,7 +16,7 @@ import android.webkit.WebViewClient
 
 /**
  * WebView 容器桥接管理
- * 负责 WebView 配置、JS 注入、单一事实来源状态同步与外设指令派发
+ * 负责 WebView 配置、JS 注入、单一事实来源状态同步与外设指令派发，以及端侧寻链拦截
  */
 class AmusicWebBridge(
     private val webView: WebView,
@@ -31,6 +31,7 @@ class AmusicWebBridge(
         fun onTrackChanged(title: String, artist: String, album: String, artworkUrl: String)
         fun onPlaybackStateChanged(isPlaying: Boolean)
         fun onOpenSettings()
+        fun onResolveSong(reqId: String, payloadJson: String)
     }
 
     init {
@@ -45,7 +46,7 @@ class AmusicWebBridge(
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        settings.allowFileAccess = false // 收紧权限，避免不必要的文件访问
+        settings.allowFileAccess = false
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         settings.builtInZoomControls = false
@@ -59,7 +60,8 @@ class AmusicWebBridge(
             WebAppInterface(
                 onTrackChangedCallback = callbacks::onTrackChanged,
                 onPlaybackStateChangedCallback = callbacks::onPlaybackStateChanged,
-                onOpenSettingsCallback = callbacks::onOpenSettings
+                onOpenSettingsCallback = callbacks::onOpenSettings,
+                onResolveSongCallback = callbacks::onResolveSong
             ),
             "AmusicNative"
         )
@@ -97,7 +99,6 @@ class AmusicWebBridge(
                 error: SslError?
             ) {
                 val url = error?.url ?: ""
-                // 仅对局域网私有 IP/localhost 自签证书放行，避免公共互联网 MITM 劫持
                 if (isLocalOrPrivateHost(url)) {
                     handler?.proceed()
                 } else {
@@ -109,7 +110,6 @@ class AmusicWebBridge(
                 view: WebView?,
                 detail: RenderProcessGoneDetail?
             ): Boolean {
-                // 渲染进程异常终止时不闪退应用
                 callbacks.onReceivedError("页面渲染进程已重置")
                 return true
             }
@@ -134,7 +134,7 @@ class AmusicWebBridge(
 
                 console.log("[AmusicNative] Injected into page.");
 
-                // 提供给原生调用的全局控制派发器 (严格幂等控制，杜绝盲目 toggle 导致状态倒错)
+                // 1. 提供给原生调用的全局控制派发器 (严格幂等控制)
                 window.__amusic_dispatch = function(action) {
                     try {
                         if (window.player) {
@@ -172,7 +172,7 @@ class AmusicWebBridge(
                     }
                 };
 
-                // 获取真实歌曲对象：从底层 player.playlist[player.currentIndex] 获取
+                // 2. 获取真实歌曲对象：从底层 player.playlist[player.currentIndex] 获取
                 function getCurrentSong() {
                     if (!window.player) return null;
                     if (window.player.playlist && window.player.currentIndex >= 0 && window.player.currentIndex < window.player.playlist.length) {
@@ -209,32 +209,68 @@ class AmusicWebBridge(
                     }
                 }
 
-                // 1. 监听底层 audio 标签原生事件
-                document.addEventListener('play', function() {
-                    syncState();
-                }, true);
+                // 3. 监听 audio 播放与 player.js 事件
+                document.addEventListener('play', function() { syncState(); }, true);
+                document.addEventListener('pause', function() { syncState(); }, true);
 
-                document.addEventListener('pause', function() {
-                    syncState();
-                }, true);
-
-                // 2. 挂钩 player.js 的自定义状态与切歌事件
                 if (window.player && typeof window.player.on === 'function') {
-                    window.player.on('stateChange', function() {
-                        syncState();
-                    });
-                    window.player.on('playlistChange', function() {
-                        syncState();
-                    });
+                    window.player.on('stateChange', function() { syncState(); });
+                    window.player.on('playlistChange', function() { syncState(); });
                 }
 
-                // 3. 初始同步与低功耗保活轮询
                 syncState();
                 setInterval(syncState, 3000);
+
+                // 4. 关键拦截：劫持 fetch('/api/resolve') 请求，优先走端侧极速直连 (遇异常 0 风险透明回退原端)
+                if (!window.__amusic_fetch_hooked) {
+                    window.__amusic_fetch_hooked = true;
+                    var _origFetch = window.fetch;
+                    window.fetch = async function(input, init) {
+                        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+                        if (url.indexOf('/api/resolve') !== -1 && init && init.method === 'POST') {
+                            try {
+                                if (window.AmusicNative && typeof window.AmusicNative.resolveSong === 'function') {
+                                    var payloadStr = typeof init.body === 'string' ? init.body : JSON.stringify(init.body || {});
+                                    var localRes = await new Promise(function(resolve) {
+                                        var reqId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+                                        window.__amusic_resolve_callbacks = window.__amusic_resolve_callbacks || {};
+                                        window.__amusic_resolve_callbacks[reqId] = resolve;
+                                        setTimeout(function() {
+                                            if (window.__amusic_resolve_callbacks[reqId]) {
+                                                delete window.__amusic_resolve_callbacks[reqId];
+                                                resolve(null);
+                                            }
+                                        }, 3000);
+                                        window.AmusicNative.resolveSong(reqId, payloadStr);
+                                    });
+
+                                    if (localRes && localRes.success && localRes.url) {
+                                        console.log("[AmusicNative] 端侧极速直链解析命中:", localRes.source_name);
+                                        return new Response(JSON.stringify(localRes), {
+                                            status: 200,
+                                            headers: { 'Content-Type': 'application/json' }
+                                        });
+                                    }
+                                }
+                            } catch(e) {
+                                console.warn("[AmusicNative] 端侧寻链异常，透明回退云端:", e);
+                            }
+                        }
+                        return _origFetch.apply(this, arguments);
+                    };
+                }
             })();
         """.trimIndent()
 
         view?.evaluateJavascript(bridgeJs, null)
+    }
+
+    fun sendResolveResult(reqId: String, resultJson: String?) {
+        val payload = resultJson ?: "null"
+        val js = "(function(){ if(window.__amusic_resolve_callbacks && window.__amusic_resolve_callbacks['$reqId']) { window.__amusic_resolve_callbacks['$reqId']($payload); delete window.__amusic_resolve_callbacks['$reqId']; } })();"
+        webView.post {
+            webView.evaluateJavascript(js, null)
+        }
     }
 
     fun dispatchAction(action: String) {

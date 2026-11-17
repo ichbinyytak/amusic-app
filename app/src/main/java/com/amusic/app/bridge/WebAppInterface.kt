@@ -8,7 +8,8 @@ import android.webkit.JavascriptInterface
 class WebAppInterface(
     private val onTrackChangedCallback: (title: String, artist: String, album: String, artworkUrl: String) -> Unit,
     private val onPlaybackStateChangedCallback: (isPlaying: Boolean) -> Unit,
-    private val onOpenSettingsCallback: () -> Unit
+    private val onOpenSettingsCallback: () -> Unit,
+    private val onResolveSongCallback: (reqId: String, payloadJson: String) -> Unit
 ) {
 
     @JavascriptInterface
@@ -29,6 +30,13 @@ class WebAppInterface(
     @JavascriptInterface
     fun openServerSettings() {
         onOpenSettingsCallback()
+    }
+
+    @JavascriptInterface
+    fun resolveSong(reqId: String?, payloadJson: String?) {
+        if (!reqId.isNullOrBlank() && !payloadJson.isNullOrBlank()) {
+            onResolveSongCallback(reqId, payloadJson)
+        }
     }
 
     @JavascriptInterface

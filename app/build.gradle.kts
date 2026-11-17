@@ -58,6 +58,7 @@ dependencies {
     implementation("androidx.media:media:1.7.0")
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil:2.7.0")
 
     testImplementation("junit:junit:4.13.2")
