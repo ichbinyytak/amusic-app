@@ -98,23 +98,6 @@ class AmusicWebBridge(
                         Log.w("AmusicNative", "从本地 assets 加载 hls.min.js 失败", e)
                     }
                 }
-                if (url.contains("akhls.streetvoice.com") || url.contains("hls.streetvoice.com")) {
-                    val domesticUrl = url
-                        .replace("akhls.streetvoice.com", "hls.streetvoice.cn")
-                        .replace("hls.streetvoice.com", "hls.streetvoice.cn")
-                    Log.i("AmusicNative", "✓ 将海外街声音频流重定向至国内高速节点: $domesticUrl")
-                    return WebResourceResponse(
-                        if (url.contains(".m3u8")) "application/vnd.apple.mpegurl" else "video/mp2t",
-                        "binary",
-                        302,
-                        "Found",
-                        mapOf(
-                            "Location" to domesticUrl,
-                            "Access-Control-Allow-Origin" to "*"
-                        ),
-                        null
-                    )
-                }
                 return super.shouldInterceptRequest(view, request)
             }
 

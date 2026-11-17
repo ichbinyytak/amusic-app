@@ -183,15 +183,14 @@ class LocalResolver(private val context: Context) {
                 if (!file.isNullOrBlank() && file.contains(".m3u8")) {
                     val cost = System.currentTimeMillis() - t0
                     val lyricCount = lyricsArray?.length() ?: 0
-                    // 核心关键转换：将海外 Akamai 节点 (akhls.streetvoice.com) 统一重写为国内高速阿里云节点 (hls.streetvoice.cn)
-                    val fastUrl = file
-                        .replace("akhls.streetvoice.com", "hls.streetvoice.cn")
-                        .replace("hls.streetvoice.com", "hls.streetvoice.cn")
-                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($domain, ${cost}ms, 歌词: ${lyricCount}行): $fastUrl")
+                    val isDomestic = domain.contains(".cn")
+                    val qualityTag = if (isDomestic) "96k" else "192k"
+                    val sourceName = if (isDomestic) "街声官方 (国内极速·$qualityTag)" else "街声官方 (原厂高清·$qualityTag)"
+                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($sourceName, ${cost}ms, 歌词: ${lyricCount}行): $file")
                     return@coroutineScope ResolveResult(
                         success = true,
-                        url = fastUrl,
-                        sourceName = "街声官方通道 ($domain 端侧直通)",
+                        url = file,
+                        sourceName = sourceName,
                         costMs = cost,
                         lyrics = lyricsArray
                     )
