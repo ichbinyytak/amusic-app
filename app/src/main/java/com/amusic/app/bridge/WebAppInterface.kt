@@ -10,7 +10,8 @@ class WebAppInterface(
     private val onPlaybackStateChangedCallback: (isPlaying: Boolean) -> Unit,
     private val onOpenSettingsCallback: () -> Unit,
     private val onResolveSongCallback: (reqId: String, payloadJson: String) -> Unit,
-    private val onGetSourcesRankingCallback: (reqId: String) -> Unit
+    private val onGetSourcesRankingCallback: (reqId: String) -> Unit,
+    private val onGetStreetVoiceLyricsCallback: (reqId: String, songId: String) -> Unit
 ) {
 
     @JavascriptInterface
@@ -44,6 +45,13 @@ class WebAppInterface(
     fun getSourcesRanking(reqId: String?) {
         if (!reqId.isNullOrBlank()) {
             onGetSourcesRankingCallback(reqId)
+        }
+    }
+
+    @JavascriptInterface
+    fun getStreetVoiceLyrics(reqId: String?, songId: String?) {
+        if (!reqId.isNullOrBlank() && !songId.isNullOrBlank()) {
+            onGetStreetVoiceLyricsCallback(reqId, songId)
         }
     }
 

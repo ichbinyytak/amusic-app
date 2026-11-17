@@ -171,6 +171,9 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                                     put("url", result.url)
                                     put("source_name", result.sourceName)
                                     put("costMs", result.costMs)
+                                    if (result.lyrics != null && result.lyrics.length() > 0) {
+                                        put("lyrics", result.lyrics)
+                                    }
                                 }.toString()
                                 webBridge.sendResolveResult(reqId, resJson)
                             } else {
@@ -191,6 +194,18 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                         } catch (e: Exception) {
                             Log.w(TAG, "获取端侧实测音源失败，回退云端: ${e.message}")
                             webBridge.sendRankingResult(reqId, null)
+                        }
+                    }
+                }
+
+                override fun onGetStreetVoiceLyrics(reqId: String, songId: String) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val lyricsJson = localResolver.fetchStreetVoiceLyrics(songId)
+                            webBridge.sendLyricResult(reqId, lyricsJson)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "端侧拉取街声歌词失败，回退云端: ${e.message}")
+                            webBridge.sendLyricResult(reqId, null)
                         }
                     }
                 }

@@ -35,12 +35,13 @@ data class ResolveResult(
     val success: Boolean,
     val url: String?,
     val sourceName: String,
-    val costMs: Long
+    val costMs: Long,
+    val lyrics: JSONArray? = null
 )
 
 /**
  * 手机端原生快速寻链中枢
- * 1. 街声 (StreetVoice) 官方直通分支：50ms 提取 HLS (.m3u8) 流，绝不串曲
+ * 1. 街声 (StreetVoice) 官方直通分支：双路并发拉取 HLS (.m3u8) 与同步/非同步歌词
  * 2. 国内并发快速搜曲 (酷我/酷狗/网易云) + 动态模板提取 + 首包嗅探
  * 3. 手机端侧真实音源测速引擎 (为前端 ⚡ 抽屉提供本机真实延迟，取代远端测速)
  */
@@ -84,7 +85,7 @@ class LocalResolver(private val context: Context) {
     ): ResolveResult? = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
 
-        // 0. 特殊分支：街声 StreetVoice 官方独立直通 (无需搜索，直接取 HLS 流)
+        // 0. 特殊分支：街声 StreetVoice 官方独立直通 (无需搜索，双路并发直取 HLS 流与歌词)
         if (platform.equals("streetvoice", ignoreCase = true) || songId.isNotBlank() && platform == "streetvoice") {
             val svResult = resolveStreetVoice(songId)
             if (svResult != null) {
@@ -135,39 +136,135 @@ class LocalResolver(private val context: Context) {
     }
 
     /**
-     * 街声 StreetVoice 原生直通解析
+     * 街声 StreetVoice 原生直通解析 (双路并发拉取音频流与歌词)
      * 手机直连 streetvoice.com 或 streetvoice.cn，耗时仅 50~100ms
      */
-    private fun resolveStreetVoice(songId: String): ResolveResult? {
+    private suspend fun resolveStreetVoice(songId: String): ResolveResult? = coroutineScope {
         val t0 = System.currentTimeMillis()
         val hosts = listOf("com", "cn")
         for (host in hosts) {
             try {
-                val url = "https://streetvoice.$host/api/v5/song/$songId/hls/file/"
+                val hlsUrl = "https://streetvoice.$host/api/v5/song/$songId/hls/file/"
+                val detailUrl = "https://streetvoice.$host/api/v5/song/$songId/"
+
+                val hlsDeferred = async(Dispatchers.IO) {
+                    val req = Request.Builder()
+                        .url(hlsUrl)
+                        .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string() ?: ""
+                            JSONObject(body).optString("file")
+                        } else null
+                    }
+                }
+
+                val detailDeferred = async(Dispatchers.IO) {
+                    val req = Request.Builder()
+                        .url(detailUrl)
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string() ?: ""
+                            val json = JSONObject(body)
+                            val rawLyrics = json.optString("lyrics")
+                            val isLrc = json.optBoolean("lyrics_is_lrc", false)
+                            parseStreetVoiceLyrics(rawLyrics, isLrc)
+                        } else null
+                    }
+                }
+
+                val file = hlsDeferred.await()
+                val lyricsArray = detailDeferred.await()
+
+                if (!file.isNullOrBlank() && file.contains(".m3u8")) {
+                    val cost = System.currentTimeMillis() - t0
+                    val lyricCount = lyricsArray?.length() ?: 0
+                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($host, ${cost}ms, 歌词: ${lyricCount}行): $file")
+                    return@coroutineScope ResolveResult(
+                        success = true,
+                        url = file,
+                        sourceName = "街声官方通道 ($host 端侧直通)",
+                        costMs = cost,
+                        lyrics = lyricsArray
+                    )
+                }
+            } catch (_: Exception) {}
+        }
+        return@coroutineScope null
+    }
+
+    /**
+     * 单独获取街声歌词（供 /api/lyric 独立拦截使用）
+     */
+    suspend fun fetchStreetVoiceLyrics(songId: String): String? = withContext(Dispatchers.IO) {
+        val hosts = listOf("com", "cn")
+        for (host in hosts) {
+            try {
+                val url = "https://streetvoice.$host/api/v5/song/$songId/"
                 val req = Request.Builder()
                     .url(url)
-                    .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                     .build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val body = resp.body?.string() ?: ""
-                        val file = JSONObject(body).optString("file")
-                        if (file.contains(".m3u8")) {
-                            val cost = System.currentTimeMillis() - t0
-                            Log.i(TAG, "✓ 街声端侧秒级直通成功 ($host, ${cost}ms): $file")
-                            return ResolveResult(
-                                success = true,
-                                url = file,
-                                sourceName = "街声官方通道 ($host 端侧直通)",
-                                costMs = cost
-                            )
-                        }
+                        val json = JSONObject(body)
+                        val rawLyrics = json.optString("lyrics")
+                        val isLrc = json.optBoolean("lyrics_is_lrc", false)
+                        val arr = parseStreetVoiceLyrics(rawLyrics, isLrc)
+                        return@withContext arr.toString()
                     }
                 }
             } catch (_: Exception) {}
         }
-        return null
+        return@withContext null
+    }
+
+    private fun parseStreetVoiceLyrics(rawLyrics: String, isLrc: Boolean): JSONArray {
+        val arr = JSONArray()
+        if (rawLyrics.isBlank()) return arr
+
+        val lrcRegex = Regex("""\[(\d{1,3}):(\d{2}(?:\.\d+)?)\](.*)""")
+        val hasLrcTag = rawLyrics.contains(Regex("""\[\d{1,3}:\d{2}"""))
+
+        if (isLrc || hasLrcTag) {
+            val lines = rawLyrics.lines()
+            for (line in lines) {
+                val match = lrcRegex.find(line.trim())
+                if (match != null) {
+                    val min = match.groupValues[1].toDoubleOrNull() ?: 0.0
+                    val sec = match.groupValues[2].toDoubleOrNull() ?: 0.0
+                    val text = match.groupValues[3].trim()
+                    if (text.isNotBlank()) {
+                        val obj = JSONObject().apply {
+                            put("time", min * 60 + sec)
+                            put("text", text)
+                        }
+                        arr.put(obj)
+                    }
+                }
+            }
+            if (arr.length() > 0) return arr
+        }
+
+        // 纯文本歌词处理 (逐行输出 untimed: true)
+        val textLines = rawLyrics.lines()
+        for (line in textLines) {
+            val clean = line.trim()
+            if (clean.isNotBlank()) {
+                val obj = JSONObject().apply {
+                    put("time", 0)
+                    put("text", clean)
+                    put("untimed", true)
+                }
+                arr.put(obj)
+            }
+        }
+        return arr
     }
 
     /**
@@ -244,7 +341,6 @@ class LocalResolver(private val context: Context) {
             }
         } catch (_: Exception) {}
 
-        // 回退测 .cn
         try {
             val t1 = System.currentTimeMillis()
             val req = Request.Builder()
