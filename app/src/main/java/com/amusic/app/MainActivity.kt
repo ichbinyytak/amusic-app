@@ -1,39 +1,32 @@
 package com.amusic.app
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.view.View
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.amusic.app.bridge.AmusicWebBridge
 import com.amusic.app.databinding.ActivityMainBinding
+import com.amusic.app.media.MediaSessionManager
+import com.amusic.app.media.MusicService
+import com.amusic.app.ui.ServerConfigDialog
 
-class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
+class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: SharedPreferences
+    private lateinit var webBridge: AmusicWebBridge
 
     private var musicService: MusicService? = null
     private var isBound = false
@@ -62,7 +55,7 @@ class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
 
         bindMusicService()
         checkNotificationPermission()
-        setupWebView()
+        setupBridge()
         setupUIListeners()
         setupBackNavigation()
 
@@ -93,183 +86,63 @@ class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        val webView = binding.webView
-        val settings = webView.settings
+    private fun setupBridge() {
+        webBridge = AmusicWebBridge(
+            webView = binding.webView,
+            callbacks = object : AmusicWebBridge.BridgeCallbacks {
+                override fun onProgressChanged(progress: Int) {
+                    binding.loadProgressBar.progress = progress
+                    binding.loadProgressBar.visibility = if (progress in 1..99) View.VISIBLE else View.GONE
+                }
 
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.databaseEnabled = true
-        settings.mediaPlaybackRequiresUserGesture = false
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        settings.allowFileAccess = true
-        settings.useWideViewPort = true
-        settings.loadWithOverviewMode = true
-        settings.builtInZoomControls = false
-        settings.displayZoomControls = false
-        settings.cacheMode = WebSettings.LOAD_DEFAULT
+                override fun onPageStarted() {
+                    binding.errorView.visibility = View.GONE
+                }
 
-        val defaultUserAgent = settings.userAgentString
-        settings.userAgentString = "$defaultUserAgent AmusicAndroidApp/1.0"
+                override fun onPageFinished() {
+                    binding.errorView.visibility = View.GONE
+                }
 
-        webView.addJavascriptInterface(
-            WebAppInterface(
-                onTrackChangedCallback = { title, artist, album, artworkUrl ->
+                override fun onReceivedError(description: String) {
+                    showError(description)
+                }
+
+                override fun onTrackChanged(
+                    title: String,
+                    artist: String,
+                    album: String,
+                    artworkUrl: String
+                ) {
                     runOnUiThread {
                         musicService?.updateTrackMetadata(title, artist, album, artworkUrl)
                     }
-                },
-                onPlaybackStateChangedCallback = { isPlaying ->
+                }
+
+                override fun onPlaybackStateChanged(isPlaying: Boolean) {
                     runOnUiThread {
                         musicService?.updatePlaybackState(isPlaying)
                     }
-                },
-                onOpenSettingsCallback = {
+                }
+
+                override fun onOpenSettings() {
                     runOnUiThread {
                         showServerConfigDialog()
                     }
                 }
-            ),
-            "AmusicNative"
+            }
         )
-
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                binding.loadProgressBar.progress = newProgress
-                if (newProgress in 1..99) {
-                    binding.loadProgressBar.visibility = View.VISIBLE
-                } else {
-                    binding.loadProgressBar.visibility = View.GONE
-                }
-            }
-        }
-
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                binding.errorView.visibility = View.GONE
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                binding.errorView.visibility = View.GONE
-                injectNativeBridge(view)
-            }
-
-            override fun onReceivedError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                error: WebResourceError?
-            ) {
-                if (request?.isForMainFrame == true) {
-                    showError(error?.description?.toString() ?: "连接失败")
-                }
-            }
-
-            @SuppressLint("WebViewClientOnReceivedSslError")
-            override fun onReceivedSslError(
-                view: WebView?,
-                handler: SslErrorHandler?,
-                error: SslError?
-            ) {
-                handler?.proceed()
-            }
-        }
-    }
-
-    private fun injectNativeBridge(webView: WebView?) {
-        val bridgeJs = """
-            (function() {
-                if (window.__amusic_bridge_injected) return;
-                window.__amusic_bridge_injected = true;
-
-                console.log("[AmusicNative] Injected into page.");
-
-                // 提供给原生调用的全局控制派发器
-                window.__amusic_dispatch = function(action) {
-                    console.log("[AmusicNative] Received action:", action);
-                    try {
-                        if (window.player) {
-                            if (action === 'togglePlay' || action === 'play' || action === 'pause') {
-                                window.player.togglePlay();
-                            } else if (action === 'next') {
-                                window.player.next();
-                            } else if (action === 'prev') {
-                                window.player.prev();
-                            }
-                            return;
-                        }
-
-                        // 备用兜底：触发 DOM 播控按钮
-                        if (action === 'togglePlay') {
-                            var playBtn = document.querySelector('#btnPlayToggle') || document.querySelector('.btn-play');
-                            if (playBtn) playBtn.click();
-                        } else if (action === 'next') {
-                            var nextBtn = document.querySelector('#btnNext') || document.querySelector('.btn-next');
-                            if (nextBtn) nextBtn.click();
-                        } else if (action === 'prev') {
-                            var prevBtn = document.querySelector('#btnPrev') || document.querySelector('.btn-prev');
-                            if (prevBtn) prevBtn.click();
-                        }
-                    } catch(e) {
-                        console.error("[AmusicNative] dispatch error:", e);
-                    }
-                };
-
-                // 监听原生 MediaSession 或底层 Audio 状态同步给 App
-                function syncState() {
-                    try {
-                        if (window.player && window.player.currentSong) {
-                            var s = window.player.currentSong;
-                            var title = s.title || s.name || "未知曲目";
-                            var artist = s.artist || "Apple Music";
-                            var album = s.album || "Amusic";
-                            var artwork = s.artwork || s.cover || s.picUrl || "";
-                            var isPlaying = window.player.isPlaying || false;
-
-                            if (window.AmusicNative) {
-                                window.AmusicNative.onTrackChanged(title, artist, album, artwork);
-                                window.AmusicNative.onPlaybackStateChanged(isPlaying);
-                            }
-                        }
-                    } catch(e) {}
-                }
-
-                // 挂钩已有的 navigator.mediaSession
-                if ('mediaSession' in navigator) {
-                    var originalMetadata = Object.getOwnPropertyDescriptor(Navigator.prototype, 'mediaSession') ||
-                                           Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
-                    // 周期性与事件性同步
-                    setInterval(syncState, 1500);
-                }
-
-                // 挂钩 audio 标签播放事件
-                document.addEventListener('play', function() {
-                    if (window.AmusicNative) window.AmusicNative.onPlaybackStateChanged(true);
-                    syncState();
-                }, true);
-
-                document.addEventListener('pause', function() {
-                    if (window.AmusicNative) window.AmusicNative.onPlaybackStateChanged(false);
-                    syncState();
-                }, true);
-
-            })();
-        """.trimIndent()
-
-        webView?.evaluateJavascript(bridgeJs, null)
     }
 
     private fun setupUIListeners() {
         binding.btnRetry.setOnClickListener {
             binding.errorView.visibility = View.GONE
-            binding.webView.reload()
+            webBridge.reload()
         }
 
         binding.btnChangeUrl.setOnClickListener {
             showServerConfigDialog()
         }
 
-        // 长按根布局可快捷唤起更换服务器弹窗
         binding.rootContainer.setOnLongClickListener {
             showServerConfigDialog()
             true
@@ -281,8 +154,8 @@ class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
             private var lastBackTime = 0L
 
             override fun handleOnBackPressed() {
-                if (binding.webView.canGoBack()) {
-                    binding.webView.goBack()
+                if (webBridge.canGoBack()) {
+                    webBridge.goBack()
                 } else {
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastBackTime < 2000) {
@@ -304,7 +177,7 @@ class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
     private fun loadCurrentServerUrl() {
         val url = getServerUrl()
         binding.tvCurrentUrl.text = url
-        binding.webView.loadUrl(url)
+        webBridge.loadUrl(url)
     }
 
     private fun showError(description: String) {
@@ -314,67 +187,52 @@ class MainActivity : AppCompatActivity(), MusicService.MusicControlListener {
     }
 
     private fun showServerConfigDialog() {
-        val current = getServerUrl()
-        val input = EditText(this).apply {
-            setText(current)
-            setSelection(current.length)
-            hint = "http://192.168.x.x:8088 或域名"
+        ServerConfigDialog.show(
+            context = this,
+            currentUrl = getServerUrl()
+        ) { newUrl ->
+            prefs.edit().putString("server_url", newUrl).apply()
+            binding.tvCurrentUrl.text = newUrl
+            webBridge.loadUrl(newUrl)
         }
-
-        AlertDialog.Builder(this)
-            .setTitle("设置 Amusic 服务器地址")
-            .setView(input)
-            .setPositiveButton("保存并刷新") { _, _ ->
-                val newUrl = input.text.toString().trim()
-                if (newUrl.isNotEmpty()) {
-                    val formattedUrl = if (!newUrl.startsWith("http://") && !newUrl.startsWith("https://")) {
-                        "http://$newUrl"
-                    } else {
-                        newUrl
-                    }
-                    prefs.edit().putString("server_url", formattedUrl).apply()
-                    binding.tvCurrentUrl.text = formattedUrl
-                    binding.webView.loadUrl(formattedUrl)
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show()
     }
 
-    // --- MusicControlListener 回调 (来自通知栏/锁屏/耳机按键) ---
+    // --- MediaSessionManager.ControlListener 回调 ---
 
     override fun onCommandPlay() {
         runOnUiThread {
-            binding.webView.evaluateJavascript("window.__amusic_dispatch && window.__amusic_dispatch('play');", null)
+            webBridge.dispatchAction("play")
         }
     }
 
     override fun onCommandPause() {
         runOnUiThread {
-            binding.webView.evaluateJavascript("window.__amusic_dispatch && window.__amusic_dispatch('pause');", null)
+            webBridge.dispatchAction("pause")
         }
     }
 
     override fun onCommandTogglePlay() {
         runOnUiThread {
-            binding.webView.evaluateJavascript("window.__amusic_dispatch && window.__amusic_dispatch('togglePlay');", null)
+            webBridge.dispatchAction("togglePlay")
         }
     }
 
     override fun onCommandPrev() {
         runOnUiThread {
-            binding.webView.evaluateJavascript("window.__amusic_dispatch && window.__amusic_dispatch('prev');", null)
+            webBridge.dispatchAction("prev")
         }
     }
 
     override fun onCommandNext() {
         runOnUiThread {
-            binding.webView.evaluateJavascript("window.__amusic_dispatch && window.__amusic_dispatch('next');", null)
+            webBridge.dispatchAction("next")
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        // 关键防护：显式解绑回调，杜绝 Activity 内存泄漏
+        musicService?.setControlListener(null)
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false

@@ -30,7 +30,7 @@
 
 ```
 amusic-app/
-├── app-debug.apk                        # 编译生成的直接安装包 (~6.7MB)
+├── app-debug.apk                        # 编译生成的直接安装包 (~6.9MB)
 ├── app/
 │   ├── src/main/
 │   │   ├── AndroidManifest.xml          # 权限声明 (明文HTTP放行、前台媒体服务、通知)
@@ -38,9 +38,17 @@ amusic-app/
 │   │   │   ├── layout/activity_main.xml # 全屏沉浸式 WebView 与网络重试换源界面
 │   │   │   └── xml/network_security_config.xml # 明文 HTTP 流量白名单配置
 │   │   └── java/com/amusic/app/
-│   │       ├── MainActivity.kt          # 核心 Activity，负责 WebView 桥接与播控调度
-│   │       ├── MusicService.kt          # 前台播放保活服务与系统 MediaSession 通知栏
-│   │       └── WebAppInterface.kt       # 原生与前端 JS 交互契约
+│   │       ├── MainActivity.kt          # 核心 Activity，负责容器生命周期与调度
+│   │       ├── bridge/
+│   │       │   ├── AmusicWebBridge.kt   # WebView 状态监听、精准 JS 注入与指令派发
+│   │       │   └── WebAppInterface.kt   # 原生与前端 JS 交互契约
+│   │       ├── media/
+│   │       │   ├── MusicService.kt      # 前台服务生命周期保活与通知刷新
+│   │       │   ├── MediaSessionManager.kt # 系统锁屏/通知栏/蓝牙外设播控中枢
+│   │       │   ├── AudioFocusHelper.kt  # 音频焦点按需申请与优雅释放
+│   │       │   └── ArtworkLoader.kt     # 封面单例加载与防内存溢出缩放
+│   │       └── ui/
+│   │           └── ServerConfigDialog.kt # 服务器换源弹窗
 │   └── build.gradle.kts
 ├── build.gradle.kts
 └── gradle.properties                   # JDK 17 与构建配置

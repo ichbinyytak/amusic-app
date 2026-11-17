@@ -1,7 +1,10 @@
-package com.amusic.app
+package com.amusic.app.bridge
 
 import android.webkit.JavascriptInterface
 
+/**
+ * 原生与前端 JS 交互契约
+ */
 class WebAppInterface(
     private val onTrackChangedCallback: (title: String, artist: String, album: String, artworkUrl: String) -> Unit,
     private val onPlaybackStateChangedCallback: (isPlaying: Boolean) -> Unit,
