@@ -9,7 +9,8 @@ class WebAppInterface(
     private val onTrackChangedCallback: (title: String, artist: String, album: String, artworkUrl: String) -> Unit,
     private val onPlaybackStateChangedCallback: (isPlaying: Boolean) -> Unit,
     private val onOpenSettingsCallback: () -> Unit,
-    private val onResolveSongCallback: (reqId: String, payloadJson: String) -> Unit
+    private val onResolveSongCallback: (reqId: String, payloadJson: String) -> Unit,
+    private val onGetSourcesRankingCallback: (reqId: String) -> Unit
 ) {
 
     @JavascriptInterface
@@ -36,6 +37,13 @@ class WebAppInterface(
     fun resolveSong(reqId: String?, payloadJson: String?) {
         if (!reqId.isNullOrBlank() && !payloadJson.isNullOrBlank()) {
             onResolveSongCallback(reqId, payloadJson)
+        }
+    }
+
+    @JavascriptInterface
+    fun getSourcesRanking(reqId: String?) {
+        if (!reqId.isNullOrBlank()) {
+            onGetSourcesRankingCallback(reqId)
         }
     }
 

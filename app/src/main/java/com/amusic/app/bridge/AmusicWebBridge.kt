@@ -16,7 +16,7 @@ import android.webkit.WebViewClient
 
 /**
  * WebView 容器桥接管理
- * 负责 WebView 配置、JS 注入、单一事实来源状态同步与外设指令派发，以及端侧寻链拦截
+ * 负责 WebView 配置、JS 注入、单一事实来源状态同步与外设指令派发，以及端侧寻链与测速拦截
  */
 class AmusicWebBridge(
     private val webView: WebView,
@@ -32,6 +32,7 @@ class AmusicWebBridge(
         fun onPlaybackStateChanged(isPlaying: Boolean)
         fun onOpenSettings()
         fun onResolveSong(reqId: String, payloadJson: String)
+        fun onGetSourcesRanking(reqId: String)
     }
 
     init {
@@ -61,7 +62,8 @@ class AmusicWebBridge(
                 onTrackChangedCallback = callbacks::onTrackChanged,
                 onPlaybackStateChangedCallback = callbacks::onPlaybackStateChanged,
                 onOpenSettingsCallback = callbacks::onOpenSettings,
-                onResolveSongCallback = callbacks::onResolveSong
+                onResolveSongCallback = callbacks::onResolveSong,
+                onGetSourcesRankingCallback = callbacks::onGetSourcesRanking
             ),
             "AmusicNative"
         )
@@ -221,12 +223,14 @@ class AmusicWebBridge(
                 syncState();
                 setInterval(syncState, 3000);
 
-                // 4. 关键拦截：劫持 fetch('/api/resolve') 请求，优先走端侧极速直连 (遇异常 0 风险透明回退原端)
+                // 4. 关键拦截：劫持 fetch 请求 (端侧极速直连与本机实时测速)
                 if (!window.__amusic_fetch_hooked) {
                     window.__amusic_fetch_hooked = true;
                     var _origFetch = window.fetch;
                     window.fetch = async function(input, init) {
                         var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+
+                        // A. 拦截 /api/resolve: 优先走端侧极速直连与街声直通
                         if (url.indexOf('/api/resolve') !== -1 && init && init.method === 'POST') {
                             try {
                                 if (window.AmusicNative && typeof window.AmusicNative.resolveSong === 'function') {
@@ -240,12 +244,12 @@ class AmusicWebBridge(
                                                 delete window.__amusic_resolve_callbacks[reqId];
                                                 resolve(null);
                                             }
-                                        }, 3000);
+                                        }, 3500);
                                         window.AmusicNative.resolveSong(reqId, payloadStr);
                                     });
 
                                     if (localRes && localRes.success && localRes.url) {
-                                        console.log("[AmusicNative] 端侧极速直链解析命中:", localRes.source_name);
+                                        console.log("[AmusicNative] 端侧直链解析命中:", localRes.source_name);
                                         return new Response(JSON.stringify(localRes), {
                                             status: 200,
                                             headers: { 'Content-Type': 'application/json' }
@@ -256,6 +260,37 @@ class AmusicWebBridge(
                                 console.warn("[AmusicNative] 端侧寻链异常，透明回退云端:", e);
                             }
                         }
+
+                        // B. 拦截 /api/sources: 替换为手机端本机的实测延迟清单
+                        if (url.indexOf('/api/sources') !== -1 && (!init || !init.method || init.method === 'GET')) {
+                            try {
+                                if (window.AmusicNative && typeof window.AmusicNative.getSourcesRanking === 'function') {
+                                    var localRanking = await new Promise(function(resolve) {
+                                        var reqId = 'rank_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+                                        window.__amusic_rank_callbacks = window.__amusic_rank_callbacks || {};
+                                        window.__amusic_rank_callbacks[reqId] = resolve;
+                                        setTimeout(function() {
+                                            if (window.__amusic_rank_callbacks[reqId]) {
+                                                delete window.__amusic_rank_callbacks[reqId];
+                                                resolve(null);
+                                            }
+                                        }, 3000);
+                                        window.AmusicNative.getSourcesRanking(reqId);
+                                    });
+
+                                    if (localRanking && localRanking.sources) {
+                                        console.log("[AmusicNative] 端侧本机实测音源列表就绪:", localRanking.sources.length + " 个音源");
+                                        return new Response(JSON.stringify(localRanking), {
+                                            status: 200,
+                                            headers: { 'Content-Type': 'application/json' }
+                                        });
+                                    }
+                                }
+                            } catch(e) {
+                                console.warn("[AmusicNative] 获取端侧音源测速异常，回退云端:", e);
+                            }
+                        }
+
                         return _origFetch.apply(this, arguments);
                     };
                 }
@@ -268,6 +303,14 @@ class AmusicWebBridge(
     fun sendResolveResult(reqId: String, resultJson: String?) {
         val payload = resultJson ?: "null"
         val js = "(function(){ if(window.__amusic_resolve_callbacks && window.__amusic_resolve_callbacks['$reqId']) { window.__amusic_resolve_callbacks['$reqId']($payload); delete window.__amusic_resolve_callbacks['$reqId']; } })();"
+        webView.post {
+            webView.evaluateJavascript(js, null)
+        }
+    }
+
+    fun sendRankingResult(reqId: String, resultJson: String?) {
+        val payload = resultJson ?: "null"
+        val js = "(function(){ if(window.__amusic_rank_callbacks && window.__amusic_rank_callbacks['$reqId']) { window.__amusic_rank_callbacks['$reqId']($payload); delete window.__amusic_rank_callbacks['$reqId']; } })();"
         webView.post {
             webView.evaluateJavascript(js, null)
         }

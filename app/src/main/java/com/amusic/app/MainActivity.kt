@@ -161,8 +161,10 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                             val artist = payload.optString("artist")
                             val album = payload.optString("album")
                             val duration = payload.optInt("duration", 0)
+                            val platform = payload.optString("platform")
+                            val id = payload.optString("id")
 
-                            val result = localResolver.resolve(title, artist, album, duration)
+                            val result = localResolver.resolve(title, artist, album, duration, platform, id)
                             if (result != null && result.success && !result.url.isNullOrBlank()) {
                                 val resJson = JSONObject().apply {
                                     put("success", true)
@@ -172,12 +174,23 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                                 }.toString()
                                 webBridge.sendResolveResult(reqId, resJson)
                             } else {
-                                // 本地无法解析或失败，透传 null 回退至原版云端 fetch
                                 webBridge.sendResolveResult(reqId, null)
                             }
                         } catch (e: Exception) {
                             Log.w(TAG, "端侧直链解析失败，回退云端: ${e.message}")
                             webBridge.sendResolveResult(reqId, null)
+                        }
+                    }
+                }
+
+                override fun onGetSourcesRanking(reqId: String) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val rankingJson = localResolver.getSourcesRanking()
+                            webBridge.sendRankingResult(reqId, rankingJson)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "获取端侧实测音源失败，回退云端: ${e.message}")
+                            webBridge.sendRankingResult(reqId, null)
                         }
                     }
                 }
