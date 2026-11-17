@@ -171,6 +171,8 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                                     put("url", result.url)
                                     put("source_name", result.sourceName)
                                     put("costMs", result.costMs)
+                                    put("is_hls", result.url.contains(".m3u8"))
+                                    put("platform", platform)
                                     if (result.lyrics != null && result.lyrics.length() > 0) {
                                         put("lyrics", result.lyrics)
                                     }
