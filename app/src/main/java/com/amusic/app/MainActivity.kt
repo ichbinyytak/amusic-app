@@ -161,8 +161,14 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                             val artist = payload.optString("artist")
                             val album = payload.optString("album")
                             val duration = payload.optInt("duration", 0)
-                            val platform = payload.optString("platform")
-                            val id = payload.optString("id")
+                            val platform = payload.optString("platform").ifBlank { payload.optString("source") }
+                            val id = payload.optString("id").ifBlank {
+                                payload.optString("songId").ifBlank {
+                                    payload.optString("song_id").ifBlank {
+                                        payload.optString("mid")
+                                    }
+                                }
+                            }
 
                             val result = localResolver.resolve(title, artist, album, duration, platform, id)
                             if (result != null && result.success && !result.url.isNullOrBlank()) {

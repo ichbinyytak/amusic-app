@@ -12,7 +12,7 @@ import android.os.Build
  */
 class AudioFocusHelper(
     context: Context,
-    private val onAudioFocusLost: () -> Unit,
+    private val onAudioFocusLost: (isTransient: Boolean) -> Unit,
     private val onAudioFocusGained: () -> Unit
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -21,10 +21,14 @@ class AudioFocusHelper(
 
     private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+            AudioManager.AUDIOFOCUS_LOSS -> {
                 hasFocus = false
-                onAudioFocusLost()
+                onAudioFocusLost(false)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                hasFocus = false
+                onAudioFocusLost(true)
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
                 hasFocus = true

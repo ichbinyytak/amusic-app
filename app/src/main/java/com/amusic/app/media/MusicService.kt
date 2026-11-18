@@ -55,6 +55,7 @@ class MusicService : Service() {
     private var currentAlbum: String = "Amusic"
     private var currentArtworkUrl: String = ""
     private var isPlaying: Boolean = false
+    private var resumeOnFocusGain: Boolean = false
     private var cachedArtwork: Bitmap? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
@@ -81,8 +82,20 @@ class MusicService : Service() {
 
         audioFocusHelper = AudioFocusHelper(
             context = this,
-            onAudioFocusLost = { controlListener?.onCommandPause() },
-            onAudioFocusGained = { /* 可根据产品逻辑自动续播或保持 */ }
+            onAudioFocusLost = { isTransient ->
+                if (isPlaying) {
+                    resumeOnFocusGain = isTransient
+                    controlListener?.onCommandPause()
+                } else {
+                    resumeOnFocusGain = false
+                }
+            },
+            onAudioFocusGained = {
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false
+                    controlListener?.onCommandPlay()
+                }
+            }
         )
 
         // 关键防护：在 onCreate 立即启动前台服务，满足系统 5 秒契约
@@ -118,12 +131,22 @@ class MusicService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_PLAY -> controlListener?.onCommandPlay()
-            ACTION_PAUSE -> controlListener?.onCommandPause()
-            ACTION_TOGGLE_PLAY -> controlListener?.onCommandTogglePlay()
+            ACTION_PLAY -> {
+                resumeOnFocusGain = false
+                controlListener?.onCommandPlay()
+            }
+            ACTION_PAUSE -> {
+                resumeOnFocusGain = false
+                controlListener?.onCommandPause()
+            }
+            ACTION_TOGGLE_PLAY -> {
+                resumeOnFocusGain = false
+                controlListener?.onCommandTogglePlay()
+            }
             ACTION_PREV -> controlListener?.onCommandPrev()
             ACTION_NEXT -> controlListener?.onCommandNext()
             ACTION_STOP -> {
+                resumeOnFocusGain = false
                 controlListener?.onCommandPause()
                 audioFocusHelper.abandonFocus()
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -145,9 +168,13 @@ class MusicService : Service() {
         this.isPlaying = playing
 
         if (playing) {
+            resumeOnFocusGain = false
             audioFocusHelper.requestFocus()
         } else {
-            audioFocusHelper.abandonFocus()
+            // 仅在非音频焦点被动打断时（即主动暂停时）才释放音频焦点
+            if (!resumeOnFocusGain) {
+                audioFocusHelper.abandonFocus()
+            }
         }
 
         mediaSessionManager.updatePlaybackState(playing)
@@ -167,11 +194,11 @@ class MusicService : Service() {
 
         this.currentArtworkUrl = artworkUrl
         this.cachedArtwork = null // 关键重置：防止切歌时残留上一首歌曲的封面造成状态污染
+        imageLoadingJob?.cancel()
         mediaSessionManager.updateMetadata(currentTitle, currentArtist, currentAlbum, null)
         startForegroundSafely(buildNotification())
 
         if (artworkUrl.isNotEmpty()) {
-            imageLoadingJob?.cancel()
             imageLoadingJob = serviceScope.launch {
                 val bitmap = artworkLoader.loadArtwork(artworkUrl)
                 if (bitmap != null && artworkUrl == currentArtworkUrl) {

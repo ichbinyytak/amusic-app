@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.net.http.SslError
 import android.util.Log
-import android.view.View
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
@@ -18,7 +17,7 @@ import android.webkit.WebViewClient
 
 /**
  * WebView 容器桥接管理
- * 负责 WebView 配置、JS 注入、单一事实来源状态同步与外设指令派发，以及端侧寻链、测速与歌词拦截
+ * 负责 WebView 配置、JS 注入、状态同步与外设指令派发，以及端侧寻链、测速与歌词拦截
  */
 class AmusicWebBridge(
     private val webView: WebView,
@@ -49,7 +48,7 @@ class AmusicWebBridge(
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         settings.allowFileAccess = false
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
@@ -150,9 +149,9 @@ class AmusicWebBridge(
         val uri = Uri.parse(url)
         val host = uri.host ?: return false
         return host == "localhost" || host == "127.0.0.1" ||
-                host.startsWith("192.168.") ||
-                host.startsWith("10.") ||
-                host.matches(Regex("""^172\.(1[6-9]|2[0-9]|3[0-1])\..*"""))
+            host.startsWith("192.168.") ||
+            host.startsWith("10.") ||
+            host.matches(Regex("""^172\.(1[6-9]|2[0-9]|3[0-1])\..*"""))
     }
 
     private fun injectNativeBridge(view: WebView?) {
@@ -160,8 +159,7 @@ class AmusicWebBridge(
             (function() {
                 if (window.__amusic_bridge_injected) return;
                 window.__amusic_bridge_injected = true;
-
-                console.log("[AmusicNative] Injected into page.");
+                window.__amusic_sv_lyrics_cache = window.__amusic_sv_lyrics_cache || {};
 
                 // 1. 提供给原生调用的全局控制派发器 (严格幂等控制)
                 window.__amusic_dispatch = function(action) {
@@ -185,7 +183,6 @@ class AmusicWebBridge(
                             return;
                         }
 
-                        // 备用兜底：触发 DOM 播控按钮
                         if (action === 'togglePlay') {
                             var playBtn = document.querySelector('#btnPlayToggle') || document.querySelector('.btn-play');
                             if (playBtn) playBtn.click();
@@ -201,7 +198,7 @@ class AmusicWebBridge(
                     }
                 };
 
-                // 2. 获取真实歌曲对象：从底层 player.playlist[player.currentIndex] 获取
+                // 2. 获取真实歌曲对象
                 function getCurrentSong() {
                     if (!window.player) return null;
                     if (window.player.playlist && window.player.currentIndex >= 0 && window.player.currentIndex < window.player.playlist.length) {
@@ -238,7 +235,6 @@ class AmusicWebBridge(
                     }
                 }
 
-                // 3. 监听 audio 播放与 player.js 事件
                 document.addEventListener('play', function() { syncState(); }, true);
                 document.addEventListener('pause', function() { syncState(); }, true);
 
@@ -248,9 +244,9 @@ class AmusicWebBridge(
                 }
 
                 syncState();
-                setInterval(syncState, 3000);
+                setInterval(syncState, 2500);
 
-                // 4. 关键拦截：劫持 fetch 请求 (端侧极速直连、街声歌词与本机实时测速)
+                // 3. 关键拦截：劫持 fetch 请求
                 if (!window.__amusic_fetch_hooked) {
                     window.__amusic_fetch_hooked = true;
                     var _origFetch = window.fetch;
@@ -263,11 +259,15 @@ class AmusicWebBridge(
                             throw abortErr;
                         }
 
-                        // A. 拦截 /api/resolve: 优先走端侧极速直连与街声直通 (含带回同源歌词)
+                        // A. 拦截 /api/resolve: 端侧极速直连与街声双线竞速
                         if (url.indexOf('/api/resolve') !== -1 && init && init.method === 'POST') {
                             try {
                                 if (window.AmusicNative && typeof window.AmusicNative.resolveSong === 'function') {
                                     var payloadStr = typeof init.body === 'string' ? init.body : JSON.stringify(init.body || {});
+                                    var parsedReq = {};
+                                    try { parsedReq = JSON.parse(payloadStr); } catch(_) {}
+                                    var reqSongId = String(parsedReq.id || parsedReq.songId || parsedReq.song_id || parsedReq.mid || '');
+
                                     var localRes = await new Promise(function(resolve, reject) {
                                         var reqId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
                                         window.__amusic_resolve_callbacks = window.__amusic_resolve_callbacks || {};
@@ -289,12 +289,14 @@ class AmusicWebBridge(
                                                 delete window.__amusic_resolve_callbacks[reqId];
                                                 resolve(null);
                                             }
-                                        }, 3500);
+                                        }, 5500);
                                         window.AmusicNative.resolveSong(reqId, payloadStr);
                                     });
 
                                     if (localRes && localRes.success && localRes.url) {
-                                        console.log("[AmusicNative] 端侧直链解析命中:", localRes.source_name);
+                                        if (reqSongId && Array.isArray(localRes.lyrics) && localRes.lyrics.length > 0) {
+                                            window.__amusic_sv_lyrics_cache[reqSongId] = localRes.lyrics;
+                                        }
                                         return new Response(JSON.stringify(localRes), {
                                             status: 200,
                                             headers: { 'Content-Type': 'application/json' }
@@ -302,18 +304,25 @@ class AmusicWebBridge(
                                     }
                                 }
                             } catch(e) {
-                                console.warn("[AmusicNative] 端侧寻链异常，透明回退云端:", e);
+                                if (e && e.name === 'AbortError') throw e;
+                                console.warn("[AmusicNative] 端侧寻链异常，回退云端:", e);
                             }
                         }
 
-                        // B. 拦截 /api/lyric: 若为街声，端侧直接返回官方抓取的歌词
-                        if (url.indexOf('/api/lyric') !== -1 && url.indexOf('platform=streetvoice') !== -1) {
+                        // B. 拦截 /api/lyric: 街声歌词优先命中 JS 缓存，其次双线并发拉取
+                        if (url.indexOf('/api/lyric') !== -1 && (url.indexOf('platform=streetvoice') !== -1 || url.indexOf('platform=sv') !== -1)) {
                             try {
-                                if (window.AmusicNative && typeof window.AmusicNative.getStreetVoiceLyrics === 'function') {
-                                    var queryStr = url.split('?')[1] || '';
-                                    var match = queryStr.match(/(?:^|&)id=([^&]+)/);
-                                    var sid = match ? decodeURIComponent(match[1]) : null;
-                                    if (sid) {
+                                var queryStr = url.split('?')[1] || '';
+                                var match = queryStr.match(/(?:^|&)(?:id|songId|song_id)=([^&]+)/);
+                                var sid = match ? decodeURIComponent(match[1]) : null;
+                                if (sid) {
+                                    if (window.__amusic_sv_lyrics_cache[sid]) {
+                                        return new Response(JSON.stringify(window.__amusic_sv_lyrics_cache[sid]), {
+                                            status: 200,
+                                            headers: { 'Content-Type': 'application/json' }
+                                        });
+                                    }
+                                    if (window.AmusicNative && typeof window.AmusicNative.getStreetVoiceLyrics === 'function') {
                                         var lrcRes = await new Promise(function(resolve) {
                                             var reqId = 'lrc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
                                             window.__amusic_lrc_callbacks = window.__amusic_lrc_callbacks || {};
@@ -323,11 +332,13 @@ class AmusicWebBridge(
                                                     delete window.__amusic_lrc_callbacks[reqId];
                                                     resolve(null);
                                                 }
-                                            }, 3000);
+                                            }, 4500);
                                             window.AmusicNative.getStreetVoiceLyrics(reqId, sid);
                                         });
                                         if (lrcRes && Array.isArray(lrcRes)) {
-                                            console.log("[AmusicNative] 端侧街声歌词秒级命中:", lrcRes.length + " 行");
+                                            if (lrcRes.length > 0) {
+                                                window.__amusic_sv_lyrics_cache[sid] = lrcRes;
+                                            }
                                             return new Response(JSON.stringify(lrcRes), {
                                                 status: 200,
                                                 headers: { 'Content-Type': 'application/json' }
@@ -336,7 +347,7 @@ class AmusicWebBridge(
                                     }
                                 }
                             } catch(e) {
-                                console.warn("[AmusicNative] 端侧街声歌词异常，透明回退云端:", e);
+                                console.warn("[AmusicNative] 端侧街声歌词异常，回退云端:", e);
                             }
                         }
 
@@ -353,12 +364,11 @@ class AmusicWebBridge(
                                                 delete window.__amusic_rank_callbacks[reqId];
                                                 resolve(null);
                                             }
-                                        }, 3000);
+                                        }, 4500);
                                         window.AmusicNative.getSourcesRanking(reqId);
                                     });
 
                                     if (localRanking && localRanking.sources) {
-                                        console.log("[AmusicNative] 端侧本机实测音源列表就绪:", localRanking.sources.length + " 个音源");
                                         return new Response(JSON.stringify(localRanking), {
                                             status: 200,
                                             headers: { 'Content-Type': 'application/json' }

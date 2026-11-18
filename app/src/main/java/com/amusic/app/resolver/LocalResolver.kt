@@ -5,7 +5,9 @@ import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -18,6 +20,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
@@ -41,25 +44,32 @@ data class ResolveResult(
 
 /**
  * 手机端原生快速寻链中枢
- * 1. 街声 (StreetVoice) 官方直通分支：双路并发拉取 HLS (.m3u8) 与同步/非同步歌词
- * 2. 国内并发快速搜曲 (酷我/酷狗/网易云) + 动态模板提取 + 首包嗅探
- * 3. 手机端侧真实音源测速引擎 (为前端 ⚡ 抽屉提供本机真实延迟，取代远端测速)
+ * 1. 街声 (StreetVoice) 双域名并发竞速直通 + 歌词内存缓存
+ * 2. 国内并发快速搜曲 (酷我/酷狗/网易云) + ID 优先模板提取 + 1.2MB 试听残卷拦截
+ * 3. 手机端侧真实音源测速引擎
  */
 class LocalResolver(private val context: Context) {
 
     companion object {
         private const val TAG = "LocalResolver"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val LYRIC_CACHE_TTL_MS = 30 * 60 * 1000L
+        private const val MIN_FULL_AUDIO_BYTES = 1_200_000L
+        private const val UA_DESKTOP =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     }
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .readTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
     private val syncManager = SourceSyncManager(context)
     private var endpoints: List<SourceEndpoint> = emptyList()
+
+    // 街声歌词内存缓存: songId -> (timestampMs, lyricsJsonArrayStr)
+    private val lyricCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     private var cachedRankingJson: String? = null
     private var lastRankingTime: Long = 0L
@@ -72,6 +82,8 @@ class LocalResolver(private val context: Context) {
         val updated = syncManager.syncIfNeeded(force)
         if (updated) {
             endpoints = syncManager.loadEndpoints()
+            cachedRankingJson = null
+            lastRankingTime = 0L
         }
     }
 
@@ -84,13 +96,13 @@ class LocalResolver(private val context: Context) {
         songId: String = ""
     ): ResolveResult? = withContext(Dispatchers.IO) {
         val t0 = System.currentTimeMillis()
+        val isStreetVoice = platform.equals("streetvoice", ignoreCase = true) ||
+            platform.equals("sv", ignoreCase = true)
 
-        // 0. 特殊分支：街声 StreetVoice 官方独立直通 (无需搜索，双路并发直取 HLS 流与歌词)
-        if (platform.equals("streetvoice", ignoreCase = true) || songId.isNotBlank() && platform == "streetvoice") {
-            val svResult = resolveStreetVoice(songId)
-            if (svResult != null) {
-                return@withContext svResult
-            }
+        // 0. 街声独立直通分支（不再落入商业曲库空转）
+        if (isStreetVoice) {
+            if (songId.isBlank()) return@withContext null
+            return@withContext resolveStreetVoice(songId)
         }
 
         if (title.isBlank()) return@withContext null
@@ -104,21 +116,21 @@ class LocalResolver(private val context: Context) {
             // 1. 国内并发快速搜曲
             val candidates = searchCandidates(title, artist, duration)
             if (candidates.isEmpty()) {
-                Log.d(TAG, "未在各平台搜到最佳匹配歌曲: $title - $artist")
+                Log.d(TAG, "未在各平台搜到最佳匹配歌曲: $title -$artist")
                 return@withContext null
             }
 
-            // 2. 挑选评分最高或优先平台的候选歌曲提取直链
+            // 2. 优先使用 ID 精准直取接口，其次按实测延迟排序
             for (cand in candidates) {
                 val matchedEndpoints = endpoints
                     .filter { it.platform == cand.platform }
-                    .sortedBy { it.sampleLatencyMs }
+                    .sortedWith(compareBy({ it.matchMode != "id" }, { it.sampleLatencyMs }))
 
                 for (ep in matchedEndpoints) {
                     val directUrl = extractStreamUrl(ep, cand)
                     if (!directUrl.isNullOrBlank() && verifyAudioStream(directUrl)) {
                         val cost = System.currentTimeMillis() - t0
-                        Log.i(TAG, "✓ 端侧直链解析成功 (${cost}ms) [${cand.platform}]: $directUrl")
+                        Log.i(TAG, "✓ 端侧直链解析成功 (${cost}ms) [${cand.platform}]:$directUrl")
                         return@withContext ResolveResult(
                             success = true,
                             url = directUrl,
@@ -136,142 +148,196 @@ class LocalResolver(private val context: Context) {
     }
 
     /**
-     * 街声 StreetVoice 原生直通解析 (双路并发拉取音频流与歌词)
-     * 国内专属高速电信节点优先 (www.streetvoice.cn)，海外节点备用 (streetvoice.com)
+     * 街声双域名并发竞速（Fastest-Wins）：
+     * 同时请求 www.streetvoice.cn 与 streetvoice.com，任一节点率先返回有效 .m3u8 即刻胜出并取消另一路
      */
     private suspend fun resolveStreetVoice(songId: String): ResolveResult? = coroutineScope {
-        val t0 = System.currentTimeMillis()
         val domains = listOf("www.streetvoice.cn", "streetvoice.com")
-        for (domain in domains) {
-            try {
-                val hlsUrl = "https://$domain/api/v5/song/$songId/hls/file/"
-                val detailUrl = "https://$domain/api/v5/song/$songId/"
+        val resultChannel = Channel<ResolveResult?>(domains.size)
 
-                val hlsDeferred = async(Dispatchers.IO) {
-                    val req = Request.Builder()
-                        .url(hlsUrl)
-                        .post("{}".toRequestBody(JSON_MEDIA_TYPE))
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                        .build()
-                    httpClient.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val body = resp.body?.string() ?: ""
-                            JSONObject(body).optString("file")
-                        } else null
-                    }
-                }
-
-                val detailDeferred = async(Dispatchers.IO) {
-                    val req = Request.Builder()
-                        .url(detailUrl)
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                        .build()
-                    httpClient.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val body = resp.body?.string() ?: ""
-                            val json = JSONObject(body)
-                            val rawLyrics = json.optString("lyrics")
-                            val isLrc = json.optBoolean("lyrics_is_lrc", false)
-                            parseStreetVoiceLyrics(rawLyrics, isLrc)
-                        } else null
-                    }
-                }
-
-                val file = hlsDeferred.await()
-                val lyricsArray = detailDeferred.await()
-
-                if (!file.isNullOrBlank() && file.contains(".m3u8")) {
-                    val cost = System.currentTimeMillis() - t0
-                    val lyricCount = lyricsArray?.length() ?: 0
-                    val isDomestic = domain.contains(".cn")
-                    val qualityTag = if (isDomestic) "96k" else "192k"
-                    val sourceName = if (isDomestic) "街声官方 (国内极速·$qualityTag)" else "街声官方 (原厂高清·$qualityTag)"
-                    Log.i(TAG, "✓ 街声端侧秒级直通成功 ($sourceName, ${cost}ms, 歌词: ${lyricCount}行): $file")
-                    return@coroutineScope ResolveResult(
-                        success = true,
-                        url = file,
-                        sourceName = sourceName,
-                        costMs = cost,
-                        lyrics = lyricsArray
-                    )
-                }
-            } catch (_: Exception) {}
+        val jobs = domains.map { domain ->
+            launch(Dispatchers.IO) {
+                val res = fetchStreetVoiceFromDomain(domain, songId)
+                resultChannel.send(res)
+            }
         }
-        return@coroutineScope null
+
+        var winner: ResolveResult? = null
+        repeat(domains.size) {
+            val candidate = resultChannel.receive()
+            if (candidate != null && winner == null) {
+                winner = candidate
+                jobs.forEach { it.cancel() }
+                return@coroutineScope winner
+            }
+        }
+        winner
     }
 
-    /**
-     * 单独获取街声歌词（供 /api/lyric 独立拦截使用）
-     */
-    suspend fun fetchStreetVoiceLyrics(songId: String): String? = withContext(Dispatchers.IO) {
-        val domains = listOf("www.streetvoice.cn", "streetvoice.com")
-        for (domain in domains) {
-            try {
-                val url = "https://$domain/api/v5/song/$songId/"
+    private suspend fun fetchStreetVoiceFromDomain(domain: String, songId: String): ResolveResult? = coroutineScope {
+        val t0 = System.currentTimeMillis()
+        try {
+            val hlsUrl = "https://$domain/api/v5/song/$songId/hls/file/"
+
+            val hlsDeferred = async(Dispatchers.IO) {
                 val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .url(hlsUrl)
+                    .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                    .header("User-Agent", UA_DESKTOP)
+                    .header("Referer", "[https://streetvoice.com/](https://streetvoice.com/)")
+                    .header("Origin", "[https://streetvoice.com](https://streetvoice.com)")
                     .build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val body = resp.body?.string() ?: ""
-                        val json = JSONObject(body)
-                        val rawLyrics = json.optString("lyrics")
-                        val isLrc = json.optBoolean("lyrics_is_lrc", false)
-                        val arr = parseStreetVoiceLyrics(rawLyrics, isLrc)
-                        return@withContext arr.toString()
-                    }
+                        JSONObject(body).optString("file")
+                    } else null
                 }
-            } catch (_: Exception) {}
+            }
+
+            val detailDeferred = async(Dispatchers.IO) {
+                fetchLyricsArrayFromDomain(domain, songId)
+            }
+
+            val file = hlsDeferred.await()
+            val lyricsArray = detailDeferred.await()
+
+            if (!file.isNullOrBlank() && file.contains(".m3u8")) {
+                if (lyricsArray != null && lyricsArray.length() > 0) {
+                    lyricCache[songId] = System.currentTimeMillis() to lyricsArray.toString()
+                }
+                val cost = System.currentTimeMillis() - t0
+                val lyricCount = lyricsArray?.length() ?: 0
+                val isDomestic = domain.contains(".cn")
+                val qualityTag = if (isDomestic) "96k" else "192k"
+                val sourceName = if (isDomestic) "街声官方 (国内节点·$qualityTag)" else "街声官方 (国际节点·$qualityTag)"
+                Log.i(TAG, "✓ 街声并发竞速胜出 ($sourceName, ${cost}ms, 歌词: ${lyricCount}行)")
+                return@coroutineScope ResolveResult(
+                    success = true,
+                    url = file,
+                    sourceName = sourceName,
+                    costMs = cost,
+                    lyrics = lyricsArray
+                )
+            }
+        } catch (_: Exception) {
         }
-        return@withContext null
+        null
     }
 
+    private fun fetchLyricsArrayFromDomain(domain: String, songId: String): JSONArray? {
+        return try {
+            val url = "https://$domain/api/v5/song/$songId/"
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", UA_DESKTOP)
+                .header("Referer", "[https://streetvoice.com/](https://streetvoice.com/)")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val body = resp.body?.string() ?: return null
+                val json = JSONObject(body)
+                val rawLyrics = json.optString("lyrics")
+                val isLrc = json.optBoolean("lyrics_is_lrc", false)
+                parseStreetVoiceLyrics(rawLyrics, isLrc)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 单独获取街声歌词（优先 0ms 命中内存缓存，未命中则双域名并发竞速）
+     */
+    suspend fun fetchStreetVoiceLyrics(songId: String): String? = withContext(Dispatchers.IO) {
+        val cached = lyricCache[songId]
+        if (cached != null && (System.currentTimeMillis() - cached.first) < LYRIC_CACHE_TTL_MS) {
+            Log.d(TAG, "✓ 街声歌词命中端侧缓存: $songId")
+            return@withContext cached.second
+        }
+
+        val domains = listOf("www.streetvoice.cn", "streetvoice.com")
+        val resultChannel = Channel<JSONArray?>(domains.size)
+
+        val jobs = domains.map { domain ->
+            launch(Dispatchers.IO) {
+                val arr = fetchLyricsArrayFromDomain(domain, songId)
+                resultChannel.send(arr)
+            }
+        }
+
+        repeat(domains.size) {
+            val candidate = resultChannel.receive()
+            if (candidate != null) {
+                jobs.forEach { it.cancel() }
+                val jsonStr = candidate.toString()
+                if (candidate.length() > 0) {
+                    lyricCache[songId] = System.currentTimeMillis() to jsonStr
+                }
+                return@withContext jsonStr
+            }
+        }
+        null
+    }
+
+    /**
+     * 支持单行多时间戳展开（如 [00:15.20][01:32.10]副歌）与纯文本无时间轴歌词
+     */
     private fun parseStreetVoiceLyrics(rawLyrics: String, isLrc: Boolean): JSONArray {
         val arr = JSONArray()
         if (rawLyrics.isBlank()) return arr
 
-        val lrcRegex = Regex("""\[(\d{1,3}):(\d{2}(?:\.\d+)?)\](.*)""")
-        val hasLrcTag = rawLyrics.contains(Regex("""\[\d{1,3}:\d{2}"""))
+        val lrcTagRegex = Regex("""\[(\d{1,3}):(\d{2}(?:\.\d+)?)\]""")
+        val metaTagRegex = Regex("""^\[(ti\vert{}ar\vert{}al\vert{}by\vert{}offset):.*\]$""", RegexOption.IGNORE_CASE)
+        val hasLrcTag = lrcTagRegex.containsMatchIn(rawLyrics)
 
         if (isLrc || hasLrcTag) {
-            val lines = rawLyrics.lines()
-            for (line in lines) {
-                val match = lrcRegex.find(line.trim())
-                if (match != null) {
-                    val min = match.groupValues[1].toDoubleOrNull() ?: 0.0
-                    val sec = match.groupValues[2].toDoubleOrNull() ?: 0.0
-                    val text = match.groupValues[3].trim()
-                    if (text.isNotBlank()) {
-                        val obj = JSONObject().apply {
-                            put("time", min * 60 + sec)
-                            put("text", text)
+            val timedEntries = mutableListOf<Pair<Double, String>>()
+            for (rawLine in rawLyrics.lines()) {
+                val trimmed = rawLine.trim()
+                if (trimmed.isBlank() || metaTagRegex.matches(trimmed)) continue
+
+                val matches = lrcTagRegex.findAll(trimmed).toList()
+                if (matches.isNotEmpty()) {
+                    val cleanText = trimmed.replace(lrcTagRegex, "").trim()
+                    if (cleanText.isNotBlank()) {
+                        for (m in matches) {
+                            val min = m.groupValues[1].toDoubleOrNull() ?: 0.0
+                            val sec = m.groupValues[2].toDoubleOrNull() ?: 0.0
+                            timedEntries.add((min * 60.0 + sec) to cleanText)
                         }
-                        arr.put(obj)
                     }
                 }
             }
-            if (arr.length() > 0) return arr
+
+            if (timedEntries.isNotEmpty()) {
+                timedEntries.sortBy { it.first }
+                for ((timeSec, text) in timedEntries) {
+                    arr.put(JSONObject().apply {
+                        put("time", timeSec)
+                        put("text", text)
+                    })
+                }
+                return arr
+            }
         }
 
-        // 纯文本歌词处理 (逐行输出 untimed: true)
-        val textLines = rawLyrics.lines()
-        for (line in textLines) {
-            val clean = line.trim()
-            if (clean.isNotBlank()) {
-                val obj = JSONObject().apply {
+        // 纯文本歌词处理（逐行输出 untimed: true）
+        for (line in rawLyrics.lines()) {
+            val clean = line.replace(lrcTagRegex, "").trim()
+            if (clean.isNotBlank() && !metaTagRegex.matches(clean)) {
+                arr.put(JSONObject().apply {
                     put("time", 0)
                     put("text", clean)
                     put("untimed", true)
-                }
-                arr.put(obj)
+                })
             }
         }
         return arr
     }
 
     /**
-     * 为前端提供手机端本机实测的音源健康度与延迟清单 (取代云端测速数据)
+     * 为前端提供手机端本机实测的音源健康度与延迟清单
      */
     suspend fun getSourcesRanking(): String = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
@@ -281,19 +347,17 @@ class LocalResolver(private val context: Context) {
 
         val list = mutableListOf<JSONObject>()
 
-        // 1. 街声官方探针 (本机实测)
         val svLatency = measureStreetVoiceLatency()
         val roundedSvLat = kotlin.math.round(svLatency).toLong()
         list.add(JSONObject().apply {
             put("id", "sv_official")
-            put("name", "街声官方直通通道")
+            put("name", "街声官方双线竞速")
             put("platform", "streetvoice")
             put("status", if (svLatency < 5000) "ok" else "failed")
             put("latency_ms", roundedSvLat)
             put("success_count", if (svLatency < 5000) 100 else 0)
         })
 
-        // 2. 本机实测活跃音源端点
         val endpointsToTest = endpoints.take(12)
         coroutineScope {
             val deferreds = endpointsToTest.map { ep ->
@@ -331,36 +395,38 @@ class LocalResolver(private val context: Context) {
         jsonStr
     }
 
-    private fun measureStreetVoiceLatency(): Double {
-        val t0 = System.currentTimeMillis()
-        try {
-            val req = Request.Builder()
-                .url("https://www.streetvoice.cn/api/v5/song/123688/hls/file/")
-                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    return (System.currentTimeMillis() - t0).toDouble()
+    private suspend fun measureStreetVoiceLatency(): Double = coroutineScope {
+        val domains = listOf("www.streetvoice.cn", "streetvoice.com")
+        val ch = Channel<Double?>(domains.size)
+        val jobs = domains.map { domain ->
+            launch(Dispatchers.IO) {
+                val t0 = System.currentTimeMillis()
+                try {
+                    val req = Request.Builder()
+                        .url("https://$domain/api/v5/song/123688/hls/file/")
+                        .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                        .header("User-Agent", UA_DESKTOP)
+                        .header("Referer", "[https://streetvoice.com/](https://streetvoice.com/)")
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            ch.send((System.currentTimeMillis() - t0).toDouble())
+                            return@launch
+                        }
+                    }
+                } catch (_: Exception) {
                 }
+                ch.send(null)
             }
-        } catch (_: Exception) {}
-
-        try {
-            val t1 = System.currentTimeMillis()
-            val req = Request.Builder()
-                .url("https://streetvoice.com/api/v5/song/123688/hls/file/")
-                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
-                .header("User-Agent", "Mozilla/5.0")
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    return (System.currentTimeMillis() - t1).toDouble()
-                }
+        }
+        repeat(domains.size) {
+            val lat = ch.receive()
+            if (lat != null) {
+                jobs.forEach { it.cancel() }
+                return@coroutineScope lat
             }
-        } catch (_: Exception) {}
-
-        return 9999.0
+        }
+        9999.0
     }
 
     private fun measureEndpointLatency(ep: SourceEndpoint): Double {
@@ -377,13 +443,14 @@ class LocalResolver(private val context: Context) {
             httpClient.newCall(req).execute().use {
                 return (System.currentTimeMillis() - t0).toDouble()
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return ep.sampleLatencyMs.toDouble()
     }
 
     private suspend fun searchCandidates(title: String, artist: String, duration: Int): List<CandidateSong> = coroutineScope {
         val cleanTitle = cleanSearchKeyword(title)
-        val query = "$cleanTitle $artist".trim()
+        val query = "$cleanTitle$artist".trim()
 
         val kwDeferred = async { searchKuwo(query, title, artist, duration) }
         val kgDeferred = async { searchKugou(query, title, artist, duration) }
@@ -399,7 +466,7 @@ class LocalResolver(private val context: Context) {
     private fun searchKuwo(query: String, targetTitle: String, targetArtist: String, targetDuration: Int): CandidateSong? {
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "https://search.kuwo.cn/r.s?client=kt&all=$encodedQuery&pn=0&rn=5&uid=794762528&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newsearch=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1"
+            val url = "[https://search.kuwo.cn/r.s?client=kt&all=$encodedQuery&pn=0&rn=5&uid=794762528&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newsearch=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1](https://search.kuwo.cn/r.s?client=kt&all=$encodedQuery&pn=0&rn=5&uid=794762528&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newsearch=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1)"
             val req = Request.Builder().url(url).header("User-Agent", "okhttp/3.10.0").build()
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
@@ -418,14 +485,15 @@ class LocalResolver(private val context: Context) {
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return null
     }
 
     private fun searchKugou(query: String, targetTitle: String, targetArtist: String, targetDuration: Int): CandidateSong? {
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "https://songsearch.kugou.com/song_search_v2?keyword=$encodedQuery&page=1&pagesize=5&clientver=&platform=WebFilter"
+            val url = "[https://songsearch.kugou.com/song_search_v2?keyword=$encodedQuery&page=1&pagesize=5&clientver=&platform=WebFilter](https://songsearch.kugou.com/song_search_v2?keyword=$encodedQuery&page=1&pagesize=5&clientver=&platform=WebFilter)"
             val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
@@ -445,14 +513,15 @@ class LocalResolver(private val context: Context) {
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return null
     }
 
     private fun searchNetease(query: String, targetTitle: String, targetArtist: String, targetDuration: Int): CandidateSong? {
         try {
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val url = "https://music.163.com/api/search/get/web?s=$encodedQuery&type=1&offset=0&total=true&limit=5"
+            val url = "[https://music.163.com/api/search/get/web?s=$encodedQuery&type=1&offset=0&total=true&limit=5](https://music.163.com/api/search/get/web?s=$encodedQuery&type=1&offset=0&total=true&limit=5)"
             val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
@@ -471,28 +540,35 @@ class LocalResolver(private val context: Context) {
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return null
     }
 
-    private fun isSongMatch(name: String, singer: String, dur: Int, targetTitle: String, targetArtist: String, targetDuration: Int): Boolean {
+    private fun isSongMatch(
+        name: String,
+        singer: String,
+        dur: Int,
+        targetTitle: String,
+        targetArtist: String,
+        targetDuration: Int
+    ): Boolean {
         val n1 = name.lowercase().replace(" ", "")
         val t1 = targetTitle.lowercase().replace(" ", "")
         if (!n1.contains(t1) && !t1.contains(n1)) return false
 
-        // 关键校验歌手：若提供了 targetArtist，防止匹配到同名不同歌手的歌曲或翻唱
         if (targetArtist.isNotBlank() && singer.isNotBlank()) {
             val s1 = singer.lowercase().replace(" ", "")
             val a1 = targetArtist.lowercase().replace(" ", "")
             val artistMatched = s1.contains(a1) || a1.contains(s1) ||
-                    a1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
-                        val p = part.trim()
-                        p.isNotEmpty() && s1.contains(p)
-                    } ||
-                    s1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
-                        val p = part.trim()
-                        p.isNotEmpty() && a1.contains(p)
-                    }
+                a1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
+                    val p = part.trim()
+                    p.isNotEmpty() && s1.contains(p)
+                } ||
+                s1.split("&", ",", "、", "/", "feat.", "ft.").any { part ->
+                    val p = part.trim()
+                    p.isNotEmpty() && a1.contains(p)
+                }
             if (!artistMatched) return false
         }
 
@@ -538,7 +614,8 @@ class LocalResolver(private val context: Context) {
                 val body = resp.body?.string() ?: return null
                 return parseUrlFromJson(body, endpoint.responseExtractor)
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return null
     }
 
@@ -556,7 +633,8 @@ class LocalResolver(private val context: Context) {
                 val u = dataObj.optString("url")
                 if (u.startsWith("http")) return u
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return null
     }
 
@@ -571,34 +649,35 @@ class LocalResolver(private val context: Context) {
                 val code = resp.code
                 if (code == 200 || code == 206) {
                     val contentType = resp.header("Content-Type")?.lowercase() ?: ""
-                    // 过滤掉带 200 状态码的 HTML/JSON 报错页
                     if (contentType.contains("text/html") || contentType.contains("application/json")) {
                         return false
                     }
 
-                    // 1. 若为 206 Partial Content，从 Content-Range: bytes 0-1024/TOTAL 获取真实音频总大小
                     val contentRange = resp.header("Content-Range")
                     val totalLen = if (!contentRange.isNullOrBlank()) {
                         val match = Regex("""bytes\s+\d+-\d+/(\d+)""").find(contentRange)
                         match?.groupValues?.get(1)?.toLongOrNull()
                     } else null
 
-                    // 2. 若为 200 OK，则直接读 Content-Length
                     val len = totalLen ?: resp.header("Content-Length")?.toLongOrNull() ?: 0L
 
-                    // 拦截 80KB / 180KB 虚假试听/静音空音频片段
+                    // 拦截 80KB/180KB 空音频及 < 1.2MB 的 30 秒 VIP 试听残卷（排除 .m3u8 索引）
                     if (len == 81920L || len == 184320L) return false
+                    if (!url.contains(".m3u8", ignoreCase = true) && len in 1 until MIN_FULL_AUDIO_BYTES) {
+                        return false
+                    }
 
                     return true
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         return false
     }
 
     private fun cleanSearchKeyword(title: String): String {
         val cleaned = title
-            .replace(Regex("""\(.*?\)|\[.*?]|【.*?】|（.*?）"""), " ")
+            .replace(Regex("""\(.*?\)|\[.*?\]|【.*?】|（.*?）"""), " ")
             .replace(Regex("""\s+"""), " ")
             .trim()
         return cleaned.ifBlank { title.trim() }
