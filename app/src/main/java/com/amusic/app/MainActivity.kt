@@ -17,6 +17,10 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
 import com.amusic.app.bridge.AmusicWebBridge
 import com.amusic.app.databinding.ActivityMainBinding
@@ -65,6 +69,7 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
         prefs = getSharedPreferences("amusic_prefs", Context.MODE_PRIVATE)
         localResolver = LocalResolver(this)
 
+        setupWindowInsets()
         bindMusicService()
         checkNotificationPermission()
         setupBridge()
@@ -106,6 +111,18 @@ class MainActivity : AppCompatActivity(), MediaSessionManager.ControlListener {
                     101
                 )
             }
+        }
+    }
+
+    private fun setupWindowInsets() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.rootContainer) { view, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.updatePadding(
+                top = insets.top,
+                bottom = insets.bottom
+            )
+            windowInsets
         }
     }
 

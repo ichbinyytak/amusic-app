@@ -9,9 +9,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.amusic.app.MainActivity
 import com.amusic.app.R
@@ -58,6 +61,9 @@ class MusicService : Service() {
     private var resumeOnFocusGain: Boolean = false
     private var cachedArtwork: Bitmap? = null
 
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
     private var imageLoadingJob: Job? = null
 
@@ -76,6 +82,7 @@ class MusicService : Service() {
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         artworkLoader = ArtworkLoader(this)
 
+        initWakeAndWifiLocks()
         createNotificationChannel()
 
         mediaSessionManager = MediaSessionManager(this) { controlListener }
@@ -148,6 +155,7 @@ class MusicService : Service() {
             ACTION_STOP -> {
                 resumeOnFocusGain = false
                 controlListener?.onCommandPause()
+                releaseLocks()
                 audioFocusHelper.abandonFocus()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -159,6 +167,7 @@ class MusicService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         // 彻底根除应用划卡后产生死锁通知栏及后台僵尸服务
+        releaseLocks()
         audioFocusHelper.abandonFocus()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -170,7 +179,9 @@ class MusicService : Service() {
         if (playing) {
             resumeOnFocusGain = false
             audioFocusHelper.requestFocus()
+            acquireLocks()
         } else {
+            releaseLocks()
             // 仅在非音频焦点被动打断时（即主动暂停时）才释放音频焦点
             if (!resumeOnFocusGain) {
                 audioFocusHelper.abandonFocus()
@@ -266,8 +277,56 @@ class MusicService : Service() {
         return builder.build()
     }
 
+    private fun initWakeAndWifiLocks() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Amusic:PlaybackWakeLock")?.apply {
+                setReferenceCounted(false)
+            }
+
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "Amusic:WifiLock")
+            } else {
+                @Suppress("DEPRECATION")
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Amusic:WifiLock")
+            }?.apply {
+                setReferenceCounted(false)
+            }
+        } catch (e: Exception) {
+            Log.w("MusicService", "初始化 WakeLock / WifiLock 失败: ${e.message}")
+        }
+    }
+
+    private fun acquireLocks() {
+        try {
+            if (wakeLock?.isHeld != true) {
+                wakeLock?.acquire(24 * 60 * 60 * 1000L)
+            }
+            if (wifiLock?.isHeld != true) {
+                wifiLock?.acquire()
+            }
+        } catch (e: Exception) {
+            Log.w("MusicService", "获取 WakeLock / WifiLock 异常: ${e.message}")
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        } catch (e: Exception) {
+            Log.w("MusicService", "释放 WakeLock / WifiLock 异常: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        releaseLocks()
         imageLoadingJob?.cancel()
         serviceScope.cancel()
         audioFocusHelper.abandonFocus()

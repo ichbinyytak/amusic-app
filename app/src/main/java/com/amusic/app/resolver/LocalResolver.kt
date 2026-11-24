@@ -76,6 +76,7 @@ class LocalResolver(private val context: Context) {
 
     init {
         endpoints = syncManager.loadEndpoints()
+        LocalAudioProxy.start()
     }
 
     suspend fun syncSources(force: Boolean = false) {
@@ -102,7 +103,11 @@ class LocalResolver(private val context: Context) {
         // 0. 街声独立直通分支（不再落入商业曲库空转）
         if (isStreetVoice) {
             if (songId.isBlank()) return@withContext null
-            return@withContext resolveStreetVoice(songId)
+            val svRes = resolveStreetVoice(songId) ?: return@withContext null
+            val proxiedUrl = if (!svRes.url.isNullOrBlank()) {
+                LocalAudioProxy.buildProxyUrl(svRes.url)
+            } else svRes.url
+            return@withContext svRes.copy(url = proxiedUrl)
         }
 
         if (title.isBlank()) return@withContext null
@@ -130,10 +135,11 @@ class LocalResolver(private val context: Context) {
                     val directUrl = extractStreamUrl(ep, cand)
                     if (!directUrl.isNullOrBlank() && verifyAudioStream(directUrl)) {
                         val cost = System.currentTimeMillis() - t0
-                        Log.i(TAG, "✓ 端侧直链解析成功 (${cost}ms) [${cand.platform}]:$directUrl")
+                        val proxiedUrl = LocalAudioProxy.buildProxyUrl(directUrl)
+                        Log.i(TAG, "✓ 端侧直链解析成功 (${cost}ms) [${cand.platform}]: $directUrl -> $proxiedUrl")
                         return@withContext ResolveResult(
                             success = true,
-                            url = directUrl,
+                            url = proxiedUrl,
                             sourceName = "端侧极速 · ${ep.name}",
                             costMs = cost
                         )

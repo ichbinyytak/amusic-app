@@ -4,7 +4,9 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.net.Uri
 import android.net.http.SslError
+import android.os.Build
 import android.util.Log
+import android.view.View
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
@@ -48,7 +50,12 @@ class AmusicWebBridge(
         settings.domStorageEnabled = true
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.textZoom = 100
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            settings.forceDark = WebSettings.FORCE_DARK_OFF
+        }
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         settings.allowFileAccess = false
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
@@ -161,6 +168,42 @@ class AmusicWebBridge(
                 window.__amusic_bridge_injected = true;
                 window.__amusic_sv_lyrics_cache = window.__amusic_sv_lyrics_cache || {};
 
+                // 0. 监听 <audio> 的 error 事件，打印具体错误码与地址
+                function reportAudioError(audio, evt) {
+                    try {
+                        var err = audio ? audio.error : null;
+                        var errCode = err ? err.code : 'unknown';
+                        var errMsg = err ? (err.message || '') : '';
+                        var src = (audio && (audio.currentSrc || audio.src)) || '';
+                        var codeMap = {
+                            1: 'MEDIA_ERR_ABORTED',
+                            2: 'MEDIA_ERR_NETWORK',
+                            3: 'MEDIA_ERR_DECODE',
+                            4: 'MEDIA_ERR_SRC_NOT_SUPPORTED'
+                        };
+                        var codeLabel = codeMap[errCode] ? (' (' + codeMap[errCode] + ')') : '';
+                        var logMsg = "[AudioError] 播放失败: code=" + errCode + codeLabel + ", message=" + errMsg + ", src=" + src;
+                        if (window.AmusicNative && typeof window.AmusicNative.log === 'function') {
+                            window.AmusicNative.log(logMsg);
+                        } else {
+                            console.error(logMsg);
+                        }
+                    } catch(ex) {
+                        console.error("[AmusicNative] reportAudioError error:", ex);
+                    }
+                }
+
+                document.addEventListener('error', function(e) {
+                    var target = e.target;
+                    if (target) {
+                        if (target.tagName && target.tagName.toLowerCase() === 'audio') {
+                            reportAudioError(target, e);
+                        } else if (target.tagName && target.tagName.toLowerCase() === 'source' && target.parentElement && target.parentElement.tagName.toLowerCase() === 'audio') {
+                            reportAudioError(target.parentElement, e);
+                        }
+                    }
+                }, true);
+
                 // 1. 提供给原生调用的全局控制派发器 (严格幂等控制)
                 window.__amusic_dispatch = function(action) {
                     try {
@@ -229,6 +272,13 @@ class AmusicWebBridge(
                         if (isPlaying !== lastSentState && window.AmusicNative) {
                             lastSentState = isPlaying;
                             window.AmusicNative.onPlaybackStateChanged(isPlaying);
+                        }
+
+                        if (window.player && window.player.audio && !window.player.audio.__amusic_error_hooked) {
+                            window.player.audio.__amusic_error_hooked = true;
+                            window.player.audio.addEventListener('error', function(e) {
+                                reportAudioError(this, e);
+                            });
                         }
                     } catch(e) {
                         console.error("[AmusicNative] sync error:", e);
